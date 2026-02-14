@@ -5,29 +5,25 @@ services:
   # Coordinator service
   - type: web
     name: ollama-coordinator
-    runtime: python3
+    runtime: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python coordinator/server.py --host 0.0.0.0 --port 8080"
+    startCommand: "python coordinator/server.py --host 0.0.0.0 --port $PORT"
     envVars:
-      - key: PORT
-        value: 8080
+      - key: PYTHON_VERSION
+        value: 3.11.0
     
   # Proxy service  
   - type: web
     name: ollama-proxy
-    runtime: python3
+    runtime: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python proxy/server.py --coordinator http://ollama-coordinator:8080 --host 0.0.0.0 --port 11434"
+    startCommand: "python proxy/server.py --coordinator https://ollama-coordinator.onrender.com --host 0.0.0.0 --port $PORT"
     envVars:
-      - key: PORT
-        value: 11434
-      - key: COORDINATOR_URL
-        fromService:
-          name: ollama-coordinator
-          type: web
-          property: host
+      - key: PYTHON_VERSION
+        value: 3.11.0
 
 # Note: Free tier apps sleep after 15 minutes of inactivity
 # They wake up automatically when a request comes in (~30 second delay)
+# Render automatically assigns PORT environment variable
