@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  coordinator:
+    build: .
+    container_name: ollama-coordinator
+    command: python coordinator/server.py --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    networks:
+      - ollama-network
+    environment:
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  proxy:
+    build: .
+    container_name: ollama-proxy
+    command: python proxy/server.py --coordinator http://coordinator:8080 --host 0.0.0.0 --port 11434
+    ports:
+      - "11434:11434"
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - ollama-network
+    environment:
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  ollama-network:
+    driver: bridge

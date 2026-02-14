@@ -1,0 +1,33 @@
+# fly.toml - Deploy to Fly.io using $5 free credit
+# This configuration runs both coordinator and proxy
+
+app = "distributed-ollama"
+primary_region = "sea"  # Seattle - change to region near you
+
+[build]
+  builder = "paketobuildpacks/builder:base"
+
+[env]
+  PORT = "8080"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+
+  [[services.ports]]
+    port = 8080
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 11434
+    handlers = ["http"]
+
+[processes]
+  coordinator = "python coordinator/server.py --host 0.0.0.0 --port 8080"
+  proxy = "python proxy/server.py --coordinator http://localhost:8080 --host 0.0.0.0 --port 11434"
+
+# Resource allocation (fits in $5 free tier)
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1

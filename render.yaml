@@ -1,0 +1,33 @@
+# render.yaml - Deploy to Render for FREE
+# Place this in the root of your repository
+
+services:
+  # Coordinator service
+  - type: web
+    name: ollama-coordinator
+    runtime: python3
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python coordinator/server.py --host 0.0.0.0 --port 8080"
+    envVars:
+      - key: PORT
+        value: 8080
+    
+  # Proxy service  
+  - type: web
+    name: ollama-proxy
+    runtime: python3
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python proxy/server.py --coordinator http://ollama-coordinator:8080 --host 0.0.0.0 --port 11434"
+    envVars:
+      - key: PORT
+        value: 11434
+      - key: COORDINATOR_URL
+        fromService:
+          name: ollama-coordinator
+          type: web
+          property: host
+
+# Note: Free tier apps sleep after 15 minutes of inactivity
+# They wake up automatically when a request comes in (~30 second delay)
