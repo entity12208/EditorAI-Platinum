@@ -137,6 +137,7 @@ class OllamaProxy:
 
 
 async def main():
+    import os
     parser = argparse.ArgumentParser(
         description='Distributed Ollama Public Proxy',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -173,16 +174,19 @@ After starting, you can use this proxy URL in EditorAI or any Ollama client:
     parser.add_argument(
         '--port',
         type=int,
-        default=11434,
+        default=None,
         help='Port to bind to (default: 11434, same as Ollama)'
     )
     
     args = parser.parse_args()
     
+    # Use PORT env var if available (for platforms like Render)
+    port = args.port or int(os.environ.get('PORT', 11434))
+    
     proxy = OllamaProxy(
         coordinator_url=args.coordinator,
         host=args.host,
-        port=args.port
+        port=port
     )
     
     await proxy.start()
