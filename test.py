@@ -251,8 +251,8 @@ async def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Test Distributed Ollama Network')
-    parser.add_argument('--coordinator', default='http://localhost:8080', help='Coordinator URL')
-    parser.add_argument('--proxy', default='http://localhost:11434', help='Proxy URL')
+    parser.add_argument('--coordinator', default='http://ollama-coordinator.onrender.com', help='Coordinator URL')
+    parser.add_argument('--proxy', default='http://ollama-proxy-sh88.onrender.com', help='Proxy URL')
     parser.add_argument('--model', help='Model to test (default: first available)')
     
     args = parser.parse_args()
