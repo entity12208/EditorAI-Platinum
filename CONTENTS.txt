@@ -1,0 +1,116 @@
+# 📦 Distributed Ollama - Complete Package
+
+Everything you need in one clean zip file.
+
+---
+
+## 📋 What's Inside
+
+```
+distributed-ollama/
+├── README.md              ← Start here! Complete setup guide
+├── DONOR_GUIDE.md         ← Share this with GPU donors
+│
+├── coordinator/
+│   └── server.py          ← Manages workers & routes requests
+├── proxy/
+│   └── server.py          ← Public Ollama-compatible API
+├── worker/
+│   └── client.py          ← Worker client for donors
+│
+├── render.yaml            ← Deploy to Render.com (easiest)
+├── docker-compose.yml     ← Deploy with Docker
+├── Dockerfile             ← Docker container config
+├── requirements.txt       ← Python dependencies
+├── .gitignore            ← Git ignore file
+└── LICENSE               ← MIT License
+```
+
+---
+
+## 🚀 Quick Start
+
+### 1. Deploy Your Server (5 minutes)
+
+**Easiest: Render.com**
+1. Push to GitHub
+2. Go to Render.com → New Blueprint
+3. Connect repo
+4. Deploy!
+
+Your URLs:
+- **Coordinator:** `https://ollama-coordinator.onrender.com`
+- **Public API:** `https://ollama-proxy-sh88.onrender.com`
+
+### 2. Share with EditorAI Users
+
+Tell them to use this URL in EditorAI settings:
+```
+https://ollama-proxy-sh88.onrender.com
+```
+
+### 3. Get GPU Donors
+
+Share **DONOR_GUIDE.md** with people who want to help.
+
+They just need to:
+```bash
+python worker/client.py
+```
+
+That's it!
+
+---
+
+## 📖 Documentation
+
+**README.md** has everything you need:
+- Deployment instructions
+- How to share with EditorAI users
+- How to get donors
+- Troubleshooting
+- Monitoring
+- Testing
+
+**DONOR_GUIDE.md** has everything donors need:
+- Step-by-step setup
+- Requirements
+- Troubleshooting
+- FAQ
+
+**No other docs needed!**
+
+---
+
+## ✅ What's Already Configured
+
+- ✅ Your Render URLs embedded in the code
+- ✅ Workers connect automatically (no manual URL entry)
+- ✅ Render deployment config ready
+- ✅ Docker deployment option included
+- ✅ All dependencies listed
+
+---
+
+## 🎯 Next Steps
+
+1. **Read README.md**
+2. **Deploy to Render** (or Docker/VPS)
+3. **Test it works**
+4. **Share DONOR_GUIDE.md** to get donors
+5. **Share API URL** with EditorAI users
+
+That's it! Everything is ready to go.
+
+---
+
+## 💡 Key Points
+
+- **README.md** = Everything for you (setup, monitoring, sharing)
+- **DONOR_GUIDE.md** = Everything for donors (installation, running)
+- **render.yaml** = One-click deployment
+- **All code** = Ready to run, no changes needed
+
+---
+
+**Deploy and enjoy!** 🚀

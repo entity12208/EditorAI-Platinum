@@ -1,444 +1,389 @@
 # Distributed Ollama Network
 
-A distributed computing system that allows users to donate their GPU/CPU resources to run Ollama models faster. This system pools compute resources from multiple contributors to provide free, fast inference for projects like EditorAI.
+Free distributed computing system that lets users donate GPU/CPU resources to run Ollama models for EditorAI and other projects.
 
-## 🚀 Key Features
+## 🚀 Quick Start
 
-- **Resource Pooling**: Combine VRAM, RAM, and compute from multiple donor machines
-- **Ollama API Compatible**: Drop-in replacement for `http://localhost:11434`
-- **Smart Load Balancing**: Automatically routes requests to the best available worker
-- **Real-time Monitoring**: Track worker status, resource usage, and request metrics
-- **Easy Setup**: Simple Python scripts with minimal configuration
-- **Zero Cost**: Completely free to use for end users
+### Your Deployed URLs
 
-## 📐 Architecture
+**Coordinator:** `https://ollama-coordinator.onrender.com`  
+**Public API:** `https://ollama-proxy-sh88.onrender.com`
 
-```
-┌─────────────────┐
-│   EditorAI      │  (or any Ollama client)
-│   User          │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Public Proxy   │  http://your-server.com:11434
-│  (Port Forward) │  Ollama-compatible API endpoint
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Coordinator    │  Manages workers and routes requests
-│  Server         │
-└────────┬────────┘
-         │
-    ┌────┴────┬────────┬────────┐
-    ▼         ▼        ▼        ▼
-┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
-│Worker 1│ │Worker 2│ │Worker 3│ │Worker N│
-│ RTX    │ │ GTX    │ │ CPU    │ │ ...    │
-│ 4090   │ │ 1080   │ │ Only   │ │        │
-└────────┘ └────────┘ └────────┘ └────────┘
-   Donors running Ollama locally
-```
+### Deploy on Render.com (5 minutes)
 
-## 🔧 Installation
+1. Push this code to GitHub
+2. Go to https://render.com (sign up free)
+3. Click "New" → "Blueprint"
+4. Connect your GitHub repo
+5. Click "Apply"
 
-### Prerequisites
+Done! Render deploys both coordinator and proxy automatically.
 
-- Python 3.8 or higher
-- For workers: [Ollama](https://ollama.ai/) installed and running
-
-### Install Dependencies
+### Test It Works
 
 ```bash
+curl https://ollama-proxy-sh88.onrender.com/health
+curl https://ollama-coordinator.onrender.com/api/status
+```
+
+---
+
+## 📋 For EditorAI Users
+
+Tell users to change their Ollama URL in EditorAI settings to:
+
+```
+https://ollama-proxy-sh88.onrender.com
+```
+
+That's it! They'll get faster AI generation powered by donated GPUs.
+
+**Note:** First request may take 30 seconds (free tier wakes up), then it's fast.
+
+---
+
+## 👥 For GPU Donors
+
+Share the **DONOR_GUIDE.md** file with people who want to donate their GPU.
+
+**TL;DR for donors:**
+```bash
+# 1. Install Ollama from ollama.ai
+# 2. Install Python from python.org
+# 3. Download models
+ollama pull llama2
+ollama pull mistral
+
+# 4. Install and run worker
 pip install -r requirements.txt
+python worker/client.py
+
+# Connects automatically to your coordinator!
 ```
 
-## 🎯 Quick Start
+---
 
-### 1. Start the Coordinator Server
+## 🏗️ Architecture
 
-The coordinator manages all workers and routes requests.
+```
+EditorAI Users
+    ↓
+https://ollama-proxy-sh88.onrender.com (Public API)
+    ↓
+https://ollama-coordinator.onrender.com (Routes requests)
+    ↓
+Worker 1 ← Worker 2 ← Worker 3 (Donated GPUs)
+```
+
+1. Workers register with coordinator (auto-detect GPU/VRAM)
+2. EditorAI sends requests to proxy
+3. Proxy forwards to coordinator
+4. Coordinator picks best available worker
+5. Worker generates response using local Ollama
+6. Response flows back to EditorAI
+
+---
+
+## 📦 What's Included
+
+```
+distributed-ollama/
+├── coordinator/server.py    # Manages workers, routes requests
+├── proxy/server.py          # Public Ollama-compatible API
+├── worker/client.py         # Worker client for donors
+├── render.yaml              # Render.com deployment config
+├── docker-compose.yml       # Docker deployment
+├── requirements.txt         # Python dependencies
+├── README.md               # This file
+└── DONOR_GUIDE.md          # Share with GPU donors
+```
+
+---
+
+## 🔧 Alternative Deployments
+
+### Docker
 
 ```bash
-python coordinator/server.py --host 0.0.0.0 --port 8080
+docker-compose up -d
 ```
 
-**Outputs:**
-- Manages worker registration and heartbeats
-- Routes inference requests to available workers
-- API endpoint: `http://localhost:8080`
-
-### 2. Start the Public Proxy (Optional but Recommended)
-
-The proxy provides a public Ollama-compatible endpoint.
+### Manual VPS Setup
 
 ```bash
-python proxy/server.py \
-  --coordinator http://localhost:8080 \
-  --host 0.0.0.0 \
-  --port 11434
+# Install dependencies
+pip install -r requirements.txt
+
+# Start coordinator
+python coordinator/server.py --host 0.0.0.0 --port 8080 &
+
+# Start proxy
+python proxy/server.py --coordinator http://localhost:8080 --port 11434 &
 ```
 
-**Outputs:**
-- Public API: `http://your-server-ip:11434`
-- Compatible with standard Ollama clients
-- Same as Ollama's default port (11434)
-
-### 3. Run a Worker (Donate Your Resources!)
-
-On any machine with Ollama installed:
+### Fly.io (Always-on free option)
 
 ```bash
-# Make sure Ollama is running first
-ollama serve
-
-# In another terminal, start the worker
-python worker/client.py \
-  --coordinator http://coordinator-server.com:8080
+fly launch --name ollama-coordinator
+fly launch --name ollama-proxy
 ```
 
-**The worker will:**
-- Detect your GPU/CPU/RAM automatically
-- Register available Ollama models
-- Send heartbeats every 10 seconds
-- Accept and process requests from the coordinator
+---
 
-## 📊 Usage Examples
+## 📊 Monitoring
 
-### For EditorAI Users
-
-Simply change the Ollama URL in EditorAI settings to:
-
-```
-http://your-distributed-ollama-server.com:11434
-```
-
-Instead of:
-
-```
-http://localhost:11434
-```
-
-That's it! EditorAI will now use the distributed network for faster generation.
-
-### Testing with cURL
+### Check Status
 
 ```bash
-# Generate text
-curl -X POST http://localhost:11434/api/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "llama2",
-    "prompt": "Create a level with platforms",
-    "stream": false
-  }'
+# See workers and stats
+curl https://ollama-coordinator.onrender.com/api/status | python -m json.tool
 
-# List available models
-curl http://localhost:11434/api/tags
-
-# Check system health
-curl http://localhost:11434/health
+# Check health
+curl https://ollama-proxy-sh88.onrender.com/health
 ```
 
-### Using with Python
+### View Logs (Render)
 
-```python
-import aiohttp
-import asyncio
+1. Go to Render dashboard
+2. Click on service (coordinator or proxy)
+3. Click "Logs" tab
 
-async def generate():
-    async with aiohttp.ClientSession() as session:
-        url = "http://localhost:11434/api/generate"
-        data = {
-            "model": "llama2",
-            "prompt": "Hello, world!",
-            "stream": False
-        }
-        async with session.post(url, json=data) as resp:
-            result = await resp.json()
-            print(result['response'])
+### Response Format
 
-asyncio.run(generate())
-```
-
-## 🖥️ Worker Requirements
-
-To donate your resources, you need:
-
-1. **Ollama Installed**:
-   ```bash
-   # Install Ollama from https://ollama.ai/
-   ollama serve
-   ```
-
-2. **At least one model downloaded**:
-   ```bash
-   # Download popular models
-   ollama pull llama2
-   ollama pull mistral
-   ollama pull codellama
-   ```
-
-3. **Run the worker**:
-   ```bash
-   python worker/client.py --coordinator http://coordinator-url:8080
-   ```
-
-### What Gets Shared?
-
-- ✅ GPU/VRAM for model inference
-- ✅ CPU for processing
-- ✅ RAM for model loading
-- ✅ Disk space for models
-- ❌ Your personal data (never accessed)
-- ❌ Internet bandwidth (minimal, only for requests)
-
-## 📈 Monitoring
-
-### Check Coordinator Status
-
-```bash
-curl http://coordinator-server.com:8080/api/status
-```
-
-**Sample output:**
 ```json
 {
   "coordinator": {
     "status": "running",
-    "workers": 5,
-    "active_workers": 4
+    "workers": 3,
+    "active_workers": 3
   },
   "workers": [
     {
-      "id": "abc123",
-      "address": "192.168.1.100:11435",
+      "id": "worker-abc-123",
       "status": "idle",
       "vram": "22.5/24.0 GB",
       "gpu": "NVIDIA RTX 4090",
-      "models": 8,
+      "models": 3,
       "requests": "0 active / 142 total"
     }
   ]
 }
 ```
 
-### View Proxy Health
+---
+
+## 🧪 Testing
+
+### Test Generation
 
 ```bash
-curl http://localhost:11434/health
+curl -X POST https://ollama-proxy-sh88.onrender.com/api/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama2",
+    "prompt": "Create a level with platforms",
+    "stream": false
+  }'
 ```
 
-## 🔒 Security Considerations
-
-### Current Implementation (v1.0)
-
-This is a **proof-of-concept** designed for trusted networks. Security features to add before production:
-
-**Recommended additions:**
-- Authentication/API keys for workers and clients
-- TLS/SSL encryption for all communication
-- Request validation and sanitization
-- Rate limiting per client
-- Worker verification/reputation system
-- Sandboxed execution environment
-
-### Deployment Recommendations
-
-1. **Run on a VPS**: Deploy the coordinator and proxy on a cloud server
-2. **Use a reverse proxy**: Put nginx/Caddy in front for TLS
-3. **Firewall rules**: Restrict access to known IPs if possible
-4. **Monitor resources**: Set up alerts for unusual activity
-
-## 🐳 Docker Deployment (Optional)
-
-### Coordinator + Proxy
-
-```dockerfile
-# Dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY coordinator/ coordinator/
-COPY proxy/ proxy/
-
-# Expose ports
-EXPOSE 8080 11434
-
-CMD ["python", "coordinator/server.py"]
-```
+### List Available Models
 
 ```bash
-# Build
-docker build -t distributed-ollama .
-
-# Run coordinator
-docker run -d -p 8080:8080 distributed-ollama python coordinator/server.py
-
-# Run proxy
-docker run -d -p 11434:11434 distributed-ollama \
-  python proxy/server.py --coordinator http://coordinator:8080
+curl https://ollama-proxy-sh88.onrender.com/api/tags
 ```
-
-## 🤝 Contributing Resources
-
-### As a Donor
-
-Thank you for considering donating your compute! Here's what to expect:
-
-- **Low impact**: Your machine handles requests only when idle
-- **No privacy concerns**: Only model inference runs, no data is stored
-- **Stop anytime**: Simply close the worker script with Ctrl+C
-- **Community driven**: Help others run AI faster for free
-
-### Optimizing Your Contribution
-
-```bash
-# Multiple GPUs? Run multiple workers
-python worker/client.py --coordinator http://... --worker-id gpu-0
-python worker/client.py --coordinator http://... --worker-id gpu-1 --ollama-port 11435
-
-# More models = more requests
-ollama pull llama2
-ollama pull mistral  
-ollama pull codellama
-ollama pull phi
-```
-
-## 🛠️ Advanced Configuration
-
-### Custom Coordinator Settings
-
-```python
-# coordinator/server.py
-coordinator = CoordinatorServer(
-    host="0.0.0.0",
-    port=8080
-)
-coordinator.heartbeat_timeout = 30  # seconds before marking worker offline
-```
-
-### Worker with Custom Resources
-
-```python
-# worker/client.py
-worker = OllamaWorker(
-    coordinator_url="http://coordinator:8080",
-    ollama_host="localhost",
-    ollama_port=11434,
-    worker_port=11435,
-    worker_id="my-powerful-gpu"
-)
-```
-
-### Load Balancing Strategy
-
-The coordinator uses this priority system:
-
-1. **Model availability**: Only workers with the requested model
-2. **Worker status**: Idle workers first, then busy workers with <2 requests
-3. **Available VRAM**: More free VRAM = higher priority
-4. **Current load**: Fewer active requests = higher priority
-
-## 📝 API Reference
-
-### Coordinator API
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/workers/register` | POST | Register a new worker |
-| `/api/workers/heartbeat` | POST | Worker heartbeat |
-| `/api/generate` | POST | Generate text (Ollama compatible) |
-| `/api/tags` | GET | List available models |
-| `/api/status` | GET | Get coordinator status |
-
-### Proxy API (Ollama Compatible)
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/generate` | POST | Generate text |
-| `/api/tags` | GET | List models |
-| `/api/version` | GET | Get version |
-| `/health` | GET | Health check |
-
-## 🐛 Troubleshooting
-
-### Worker Can't Connect to Ollama
-
-```bash
-# Check if Ollama is running
-curl http://localhost:11434/api/tags
-
-# Start Ollama if needed
-ollama serve
-```
-
-### No Models Available
-
-```bash
-# Pull some models
-ollama pull llama2
-ollama pull mistral
-
-# Verify
-ollama list
-```
-
-### Worker Not Registering
-
-```bash
-# Check coordinator is running
-curl http://coordinator:8080/api/status
-
-# Check firewall isn't blocking
-# On coordinator server, ensure port 8080 is open
-```
-
-### Requests Timing Out
-
-- Check if any workers are active: `curl http://coordinator:8080/api/status`
-- Verify the requested model is available on at least one worker
-- Increase timeout in proxy settings
-
-## 📊 Performance Tips
-
-### For Best Performance
-
-1. **Use workers with GPUs**: VRAM > 8GB recommended
-2. **Download small models**: `phi` (2.7B) is fast, `llama2:7b` is good quality
-3. **Run multiple workers**: More workers = more parallel capacity
-4. **Locate workers near users**: Reduce network latency
-5. **Keep workers updated**: Latest Ollama version = best performance
-
-### Benchmarks (Example)
-
-| Setup | Model | Generation Speed |
-|-------|-------|------------------|
-| Single RTX 4090 | llama2:7b | ~80 tokens/sec |
-| 3x RTX 3080 | llama2:7b | ~240 tokens/sec (parallel) |
-| 10x Mixed GPUs | llama2:7b | ~600+ tokens/sec (parallel) |
-
-## 📜 License
-
-MIT License - Feel free to use, modify, and distribute.
-
-## 🙏 Acknowledgments
-
-- Built for the [EditorAI](https://github.com/entity12208/EditorAI) project
-- Powered by [Ollama](https://ollama.ai/)
-- Thanks to all resource donors making this free!
-
-## 📧 Support
-
-For issues, questions, or suggestions:
-- Open an issue on GitHub
-- Check the troubleshooting section above
-- Review logs for error messages
 
 ---
 
-**Made with ❤️ for the AI community**
+## ⚙️ Configuration
+
+### Environment Variables
+
+**Coordinator:**
+- `PORT` - Port to bind to (auto-set by Render)
+
+**Proxy:**
+- `PORT` - Port to bind to (auto-set by Render)
+
+**Worker:**
+- Coordinator URL embedded: `https://ollama-coordinator.onrender.com`
+- Override with: `python worker/client.py --coordinator <url>`
+
+### Models
+
+Workers can install any Ollama models:
+```bash
+ollama pull llama2      # Best quality
+ollama pull mistral     # Fast & good
+ollama pull phi         # Smallest, fastest
+ollama pull codellama   # For code
+```
+
+---
+
+## 🐛 Troubleshooting
+
+### "No workers available"
+
+**Cause:** No donors connected yet.
+
+**Solution:** 
+- Share DONOR_GUIDE.md to get donors
+- At least 1 person needs to run the worker
+
+### "Service Unavailable" / "Connection refused"
+
+**Cause:** Free tier servers sleep after 15 minutes.
+
+**Solution:**
+- Wait 30 seconds - server is waking up
+- This is normal for free hosting
+- First request wakes it up
+
+**Optional fix:** Use UptimeRobot.com (free) to ping every 5 minutes
+
+### "Request timeout"
+
+**Cause:** All workers busy or complex prompt.
+
+**Solutions:**
+- Simplify prompt
+- Add more workers
+- Try different model (phi is fastest)
+
+### Worker can't connect
+
+**Donor should check:**
+```bash
+# Is Ollama running?
+ollama list
+
+# Is coordinator reachable?
+curl https://ollama-coordinator.onrender.com/api/status
+
+# Try running worker with verbose output
+python worker/client.py
+```
+
+---
+
+## 📈 Performance Tips
+
+### For Best Performance
+
+1. **Get more workers** - More GPUs = faster, more capacity
+2. **Use powerful GPUs** - RTX 4090 > RTX 3080 > GTX 1660
+3. **Multiple models** - llama2, mistral, phi covers most needs
+4. **Keep services awake** - Use UptimeRobot to prevent cold starts
+
+### Expected Generation Times
+
+| Setup | Time |
+|-------|------|
+| Local CPU | 3-5 min |
+| Single GPU donor | 30-45 sec |
+| 3 GPU donors | 15-30 sec |
+| 10+ GPU donors | 5-10 sec |
+
+---
+
+## 🔒 Security Notes
+
+**Current version (v1.0) is for trusted networks.**
+
+For production with untrusted users, add:
+- API key authentication
+- Rate limiting
+- TLS/SSL encryption (use Cloudflare or nginx)
+- Request validation
+- Worker verification
+
+---
+
+## 💰 Cost
+
+**Everything is FREE:**
+- Render.com free tier (750 hrs/month)
+- Workers donated by community
+- No API costs
+
+**Only cost: Your time**
+
+**Optional upgrade:**
+- Render paid tier: $7/month (no sleep mode)
+- VPS: $5-10/month (Oracle Cloud is free forever)
+
+---
+
+## 🤝 Contributing
+
+### As a Donor
+
+Run the worker when you're not using your GPU:
+```bash
+python worker/client.py
+```
+
+### As a Developer
+
+1. Fork the repository
+2. Make improvements
+3. Submit pull request
+
+### Ideas for Improvement
+
+- Add authentication
+- Add streaming support
+- Add model caching
+- Add metrics dashboard
+- Add request queuing
+- Add multi-region support
+
+---
+
+## 📜 License
+
+MIT License - Free to use, modify, and distribute.
+
+---
+
+## 🙏 Credits
+
+- Built for [EditorAI](https://github.com/entity12208/EditorAI)
+- Powered by [Ollama](https://ollama.ai)
+- Thanks to all GPU donors!
+
+---
+
+## 📞 Support
+
+**URLs:**
+- Coordinator: https://ollama-coordinator.onrender.com
+- Public API: https://ollama-proxy-sh88.onrender.com
+
+**Check status:**
+```bash
+curl https://ollama-coordinator.onrender.com/api/status
+```
+
+**For issues:**
+1. Check troubleshooting section above
+2. Verify services are running on Render dashboard
+3. Check logs for error messages
+4. Test with curl commands
+
+---
+
+## 🎯 Quick Reference
+
+| Task | Command |
+|------|---------|
+| Deploy | Push to GitHub → Render Blueprint |
+| Check status | `curl .../api/status` |
+| Test health | `curl .../health` |
+| Test generation | `curl -X POST .../api/generate` |
+| Share with EditorAI | URL: `https://ollama-proxy-sh88.onrender.com` |
+| Share with donors | Give them `DONOR_GUIDE.md` |
+
+---
+
+**That's it! Deploy, share, and watch your distributed AI network grow.** 🚀

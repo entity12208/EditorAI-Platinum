@@ -284,21 +284,24 @@ async def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Connect to a coordinator server
+  # Connect to the public coordinator (default)
+  python worker.py
+  
+  # Connect to a custom coordinator
   python worker.py --coordinator http://coordinator.example.com:8080
   
   # Use a custom Ollama port
-  python worker.py --coordinator http://coordinator.example.com:8080 --ollama-port 11434
+  python worker.py --ollama-port 11434
   
   # Specify a custom worker ID (useful for multiple GPUs)
-  python worker.py --coordinator http://coordinator.example.com:8080 --worker-id my-gpu-1
+  python worker.py --worker-id my-gpu-1
         """
     )
     
     parser.add_argument(
         '--coordinator',
-        required=True,
-        help='Coordinator server URL (e.g., http://coordinator.example.com:8080)'
+        default='https://ollama-coordinator.onrender.com',
+        help='Coordinator server URL (default: https://ollama-coordinator.onrender.com)'
     )
     parser.add_argument(
         '--ollama-host',

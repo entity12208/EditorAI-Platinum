@@ -15,7 +15,11 @@ services:
     
   # Proxy service  
   - type: web
+<<<<<<< HEAD
     name: ollama-proxy
+=======
+    name: ollama-proxy-sh88
+>>>>>>> 5c2c15c (Update)
     runtime: python
     plan: free
     buildCommand: "pip install -r requirements.txt"

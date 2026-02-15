@@ -362,12 +362,16 @@ class CoordinatorServer:
 
 if __name__ == '__main__':
     import argparse
+    import os
     
     parser = argparse.ArgumentParser(description='Distributed Ollama Coordinator Server')
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
-    parser.add_argument('--port', type=int, default=8080, help='Port to bind to')
+    parser.add_argument('--port', type=int, default=None, help='Port to bind to')
     
     args = parser.parse_args()
     
-    coordinator = CoordinatorServer(host=args.host, port=args.port)
+    # Use PORT env var if available (for platforms like Render)
+    port = args.port or int(os.environ.get('PORT', 8080))
+    
+    coordinator = CoordinatorServer(host=args.host, port=port)
     asyncio.run(coordinator.start())
