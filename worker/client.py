@@ -220,6 +220,107 @@ class OllamaWorker:
             
             await asyncio.sleep(10)  # Send heartbeat every 10 seconds
     
+    async def poll_for_work(self):
+        """Poll coordinator for work to do"""
+        while self.is_running:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    url = f"{self.coordinator_url}/api/work?worker_id={self.worker_id}"
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            work = await resp.json()
+                            request_id = work.get('request_id')
+                            
+                            if request_id:
+                                # Got work to do!
+                                logger.info(f"Received work: {request_id}")
+                                await self.process_work(request_id, work)
+                            else:
+                                # No work available, wait a bit
+                                await asyncio.sleep(2)
+                        else:
+                            logger.warning(f"Failed to get work: HTTP {resp.status}")
+                            await asyncio.sleep(5)
+                            
+            except Exception as e:
+                logger.error(f"Error polling for work: {e}")
+                await asyncio.sleep(5)
+    
+    async def process_work(self, request_id: str, work: dict):
+        """Process a work request using local Ollama"""
+        try:
+            model = work.get('model')
+            prompt = work.get('prompt')
+            options = work.get('options', {})
+            
+            logger.info(f"Processing request {request_id} with model {model}")
+            
+            # Call local Ollama
+            async with aiohttp.ClientSession() as session:
+                ollama_data = {
+                    'model': model,
+                    'prompt': prompt,
+                    'stream': False,
+                    'options': options
+                }
+                
+                async with session.post(
+                    f"{self.ollama_url}/api/generate",
+                    json=ollama_data,
+                    timeout=aiohttp.ClientTimeout(total=300)
+                ) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        logger.info(f"Request {request_id} completed successfully")
+                        
+                        # Submit result back to coordinator
+                        await self.submit_result(request_id, result)
+                    else:
+                        error_text = await resp.text()
+                        logger.error(f"Ollama error for request {request_id}: {error_text}")
+                        await self.submit_error(request_id, f"Ollama error: {error_text}")
+                        
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout processing request {request_id}")
+            await self.submit_error(request_id, "Timeout processing request")
+        except Exception as e:
+            logger.error(f"Error processing request {request_id}: {e}")
+            await self.submit_error(request_id, str(e))
+    
+    async def submit_result(self, request_id: str, result: dict):
+        """Submit completed result to coordinator"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.coordinator_url}/api/result/{request_id}"
+                data = {
+                    'worker_id': self.worker_id,
+                    'result': result
+                }
+                async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        logger.info(f"Submitted result for {request_id}")
+                    else:
+                        logger.error(f"Failed to submit result: HTTP {resp.status}")
+        except Exception as e:
+            logger.error(f"Error submitting result: {e}")
+    
+    async def submit_error(self, request_id: str, error: str):
+        """Submit error result to coordinator"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.coordinator_url}/api/result/{request_id}"
+                data = {
+                    'worker_id': self.worker_id,
+                    'error': error
+                }
+                async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        logger.info(f"Submitted error for {request_id}")
+                    else:
+                        logger.error(f"Failed to submit error: HTTP {resp.status}")
+        except Exception as e:
+            logger.error(f"Error submitting error: {e}")
+    
     async def check_ollama_running(self) -> bool:
         """Check if Ollama is running"""
         try:
@@ -260,8 +361,11 @@ class OllamaWorker:
         # Start heartbeat task
         heartbeat_task = asyncio.create_task(self.send_heartbeat())
         
+        # Start work polling task
+        work_task = asyncio.create_task(self.poll_for_work())
+        
         logger.info("=" * 60)
-        logger.info("Worker is now active and accepting requests!")
+        logger.info("Worker is now active and polling for work!")
         logger.info("Your resources are being shared with the network.")
         logger.info("Press Ctrl+C to stop donating resources.")
         logger.info("=" * 60)
@@ -273,6 +377,7 @@ class OllamaWorker:
             logger.info("\nShutting down worker...")
             self.is_running = False
             heartbeat_task.cancel()
+            work_task.cancel()
             logger.info("Worker stopped. Thank you for contributing!")
 
 

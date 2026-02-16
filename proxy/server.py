@@ -25,7 +25,7 @@ class OllamaProxy:
         self.request_count = 0
         
     async def proxy_generate(self, request: web.Request) -> web.Response:
-        """Proxy /api/generate requests to coordinator"""
+        """Proxy /api/generate requests to coordinator using queue system"""
         try:
             self.request_count += 1
             data = await request.json()
@@ -33,11 +33,64 @@ class OllamaProxy:
             logger.info(f"Request #{self.request_count}: Generating with model '{data.get('model', 'unknown')}'")
             
             async with ClientSession() as session:
+                # Step 1: Queue the request
                 url = f"{self.coordinator_url}/api/generate"
-                async with session.post(url, json=data, timeout=ClientTimeout(total=300)) as resp:
-                    result = await resp.json()
-                    logger.info(f"Request #{self.request_count}: Completed successfully")
-                    return web.json_response(result, status=resp.status)
+                async with session.post(url, json=data, timeout=ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(f"Request #{self.request_count}: Failed to queue - {error_text}")
+                        return web.json_response({
+                            'error': error_text
+                        }, status=resp.status)
+                    
+                    queue_result = await resp.json()
+                    request_id = queue_result.get('request_id')
+                    
+                    if not request_id:
+                        return web.json_response({
+                            'error': 'No request_id returned'
+                        }, status=500)
+                    
+                    logger.info(f"Request #{self.request_count}: Queued as {request_id}")
+                
+                # Step 2: Poll for result
+                result_url = f"{self.coordinator_url}/api/result/{request_id}"
+                max_wait = 300  # 5 minutes
+                poll_interval = 2  # seconds
+                elapsed = 0
+                
+                while elapsed < max_wait:
+                    await asyncio.sleep(poll_interval)
+                    elapsed += poll_interval
+                    
+                    async with session.get(result_url, timeout=ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            result_data = await resp.json()
+                            status = result_data.get('status')
+                            
+                            if status == 'completed':
+                                logger.info(f"Request #{self.request_count}: Completed successfully")
+                                return web.json_response(result_data.get('result', {}))
+                            elif status == 'failed':
+                                logger.error(f"Request #{self.request_count}: Failed - {result_data.get('error')}")
+                                return web.json_response({
+                                    'error': result_data.get('error', 'Unknown error')
+                                }, status=500)
+                            elif status == 'timeout':
+                                logger.error(f"Request #{self.request_count}: Timed out")
+                                return web.json_response({
+                                    'error': 'Request timed out'
+                                }, status=504)
+                            else:
+                                # Still processing, continue polling
+                                logger.debug(f"Request #{self.request_count}: Status = {status}, elapsed = {elapsed}s")
+                                continue
+                
+                # Timeout waiting for result
+                logger.error(f"Request #{self.request_count}: Timeout after {elapsed}s")
+                return web.json_response({
+                    'error': 'Timeout waiting for result'
+                }, status=504)
                     
         except asyncio.TimeoutError:
             logger.error(f"Request #{self.request_count}: Timeout")
