@@ -33,27 +33,54 @@ class OllamaProxy:
             logger.info(f"Request #{self.request_count}: Generating with model '{data.get('model', 'unknown')}'")
             
             async with ClientSession() as session:
-                # Step 1: Queue the request
+                # Step 1: Queue the request - retry up to 5 times to handle
+                # coordinator waking up from Render free tier sleep (~30s)
                 url = f"{self.coordinator_url}/api/generate"
-                async with session.post(url, json=data, timeout=ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        logger.error(f"Request #{self.request_count}: Failed to queue - {error_text}")
-                        return web.json_response({
-                            'error': error_text
-                        }, status=resp.status)
-                    
-                    queue_result = await resp.json()
-                    request_id = queue_result.get('request_id')
-                    
-                    if not request_id:
-                        return web.json_response({
-                            'error': 'No request_id returned'
-                        }, status=500)
-                    
-                    logger.info(f"Request #{self.request_count}: Queued as {request_id}")
+                queue_result = None
+                last_error = None
                 
-                # Step 2: Poll for result
+                for attempt in range(5):
+                    try:
+                        if attempt > 0:
+                            wait = 15 * attempt
+                            logger.info(f"Request #{self.request_count}: Retrying queue (attempt {attempt + 1}/5, waiting {wait}s for coordinator to wake)...")
+                            await asyncio.sleep(wait)
+                        
+                        async with session.post(
+                            url,
+                            json=data,
+                            timeout=ClientTimeout(total=60)  # 60s - enough for Render cold start
+                        ) as resp:
+                            if resp.status == 200:
+                                queue_result = await resp.json()
+                                break
+                            else:
+                                last_error = await resp.text()
+                                logger.warning(f"Request #{self.request_count}: Queue attempt {attempt + 1} failed: HTTP {resp.status} - {last_error}")
+                                
+                    except asyncio.TimeoutError:
+                        last_error = "Coordinator timeout (may be waking from sleep)"
+                        logger.warning(f"Request #{self.request_count}: Queue attempt {attempt + 1} timed out")
+                    except Exception as e:
+                        last_error = str(e)
+                        logger.warning(f"Request #{self.request_count}: Queue attempt {attempt + 1} error: {e}")
+                
+                if not queue_result:
+                    logger.error(f"Request #{self.request_count}: All queue attempts failed: {last_error}")
+                    return web.json_response({
+                        'error': last_error or 'Failed to reach coordinator'
+                    }, status=503)
+                
+                request_id = queue_result.get('request_id')
+                
+                if not request_id:
+                    return web.json_response({
+                        'error': 'No request_id returned from coordinator'
+                    }, status=500)
+                
+                logger.info(f"Request #{self.request_count}: Queued as {request_id}")
+                
+                # Step 2: Poll for result (coordinator is now awake, so 15s timeout per poll is fine)
                 result_url = f"{self.coordinator_url}/api/result/{request_id}"
                 max_wait = 300  # 5 minutes
                 poll_interval = 2  # seconds
@@ -63,42 +90,42 @@ class OllamaProxy:
                     await asyncio.sleep(poll_interval)
                     elapsed += poll_interval
                     
-                    async with session.get(result_url, timeout=ClientTimeout(total=5)) as resp:
-                        if resp.status == 200:
-                            result_data = await resp.json()
-                            status = result_data.get('status')
-                            
-                            if status == 'completed':
-                                logger.info(f"Request #{self.request_count}: Completed successfully")
-                                return web.json_response(result_data.get('result', {}))
-                            elif status == 'failed':
-                                logger.error(f"Request #{self.request_count}: Failed - {result_data.get('error')}")
-                                return web.json_response({
-                                    'error': result_data.get('error', 'Unknown error')
-                                }, status=500)
-                            elif status == 'timeout':
-                                logger.error(f"Request #{self.request_count}: Timed out")
-                                return web.json_response({
-                                    'error': 'Request timed out'
-                                }, status=504)
-                            else:
-                                # Still processing, continue polling
-                                logger.debug(f"Request #{self.request_count}: Status = {status}, elapsed = {elapsed}s")
-                                continue
+                    try:
+                        async with session.get(result_url, timeout=ClientTimeout(total=15)) as resp:
+                            if resp.status == 200:
+                                result_data = await resp.json()
+                                status = result_data.get('status')
+                                
+                                if status == 'completed':
+                                    logger.info(f"Request #{self.request_count}: Completed in {elapsed}s")
+                                    return web.json_response(result_data.get('result', {}))
+                                elif status == 'failed':
+                                    logger.error(f"Request #{self.request_count}: Failed - {result_data.get('error')}")
+                                    return web.json_response({
+                                        'error': result_data.get('error', 'Unknown error')
+                                    }, status=500)
+                                elif status == 'timeout':
+                                    logger.error(f"Request #{self.request_count}: Timed out")
+                                    return web.json_response({
+                                        'error': 'Request timed out waiting for worker'
+                                    }, status=504)
+                                else:
+                                    logger.debug(f"Request #{self.request_count}: Status = {status}, elapsed = {elapsed}s")
+                                    continue
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Request #{self.request_count}: Poll timeout at {elapsed}s, retrying...")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Request #{self.request_count}: Poll error at {elapsed}s: {e}, retrying...")
+                        continue
                 
-                # Timeout waiting for result
                 logger.error(f"Request #{self.request_count}: Timeout after {elapsed}s")
                 return web.json_response({
                     'error': 'Timeout waiting for result'
                 }, status=504)
                     
-        except asyncio.TimeoutError:
-            logger.error(f"Request #{self.request_count}: Timeout")
-            return web.json_response({
-                'error': 'Request timeout. All workers may be busy.'
-            }, status=504)
         except Exception as e:
-            logger.error(f"Request #{self.request_count}: Error - {e}")
+            logger.error(f"Request #{self.request_count}: Unexpected error - {e}")
             return web.json_response({
                 'error': str(e)
             }, status=500)
@@ -126,14 +153,12 @@ class OllamaProxy:
     async def health_check(self, request: web.Request) -> web.Response:
         """Health check endpoint"""
         try:
-            # Check if coordinator is reachable
             async with ClientSession() as session:
                 url = f"{self.coordinator_url}/api/status"
-                async with session.get(url, timeout=ClientTimeout(total=5)) as resp:
+                async with session.get(url, timeout=ClientTimeout(total=60)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         active_workers = data['coordinator']['active_workers']
-                        
                         return web.json_response({
                             'status': 'healthy',
                             'coordinator': 'connected',
@@ -153,6 +178,21 @@ class OllamaProxy:
                 'error': str(e)
             }, status=503)
     
+    async def keep_coordinator_alive(self):
+        """Ping coordinator every 10 minutes to prevent Render free tier sleep"""
+        while True:
+            try:
+                await asyncio.sleep(600)  # 10 minutes
+                async with ClientSession() as session:
+                    url = f"{self.coordinator_url}/api/status"
+                    async with session.get(url, timeout=ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            logger.debug("Keep-alive ping to coordinator successful")
+                        else:
+                            logger.warning(f"Keep-alive ping returned HTTP {resp.status}")
+            except Exception as e:
+                logger.debug(f"Keep-alive ping failed (coordinator may be sleeping): {e}")
+
     async def start(self):
         """Start the proxy server"""
         app = web.Application()
@@ -165,6 +205,9 @@ class OllamaProxy:
         # Additional routes
         app.router.add_get('/health', self.health_check)
         
+        # Start keep-alive task to prevent coordinator sleeping
+        asyncio.create_task(self.keep_coordinator_alive())
+        
         logger.info("=" * 70)
         logger.info("Distributed Ollama Public Proxy")
         logger.info("=" * 70)
@@ -172,12 +215,11 @@ class OllamaProxy:
         logger.info(f"Coordinator: {self.coordinator_url}")
         logger.info("")
         logger.info("Available endpoints:")
-        logger.info(f"  - POST http://{self.host}:{self.port}/api/generate")
-        logger.info(f"  - GET  http://{self.host}:{self.port}/api/tags")
-        logger.info(f"  - GET  http://{self.host}:{self.port}/health")
+        logger.info(f"  - POST /api/generate")
+        logger.info(f"  - GET  /api/tags")
+        logger.info(f"  - GET  /health")
         logger.info("")
         logger.info("This proxy is Ollama API compatible!")
-        logger.info("You can use it as a drop-in replacement for http://localhost:11434")
         logger.info("=" * 70)
         
         runner = web.AppRunner(app)
