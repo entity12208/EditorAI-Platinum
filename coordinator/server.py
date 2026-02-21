@@ -15,6 +15,23 @@ from enum import Enum
 from aiohttp import web
 import uuid
 
+
+@web.middleware
+async def cors_middleware(request, handler):
+    """Add CORS headers to every response so browsers can read the API."""
+    if request.method == 'OPTIONS':
+        return web.Response(headers={
+            'Access-Control-Allow-Origin':  '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type',
+        })
+    response = await handler(request)
+    response.headers['Access-Control-Allow-Origin']  = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -466,7 +483,7 @@ class CoordinatorServer:
     
     async def start(self):
         """Start the coordinator server"""
-        app = web.Application()
+        app = web.Application(middlewares=[cors_middleware])
         
         app.router.add_post('/api/workers/register', self.register_worker)
         app.router.add_post('/api/workers/heartbeat', self.heartbeat)
