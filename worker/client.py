@@ -405,8 +405,8 @@ Examples:
     
     parser.add_argument(
         '--coordinator',
-        default='https://ollama-coordinator.onrender.com',
-        help='Coordinator server URL (default: https://ollama-coordinator.onrender.com)'
+        default='http://sn-1.vltgg.net:21800',
+        help='Coordinator server URL (default: http://sn-1.vltgg.net:21800)'
     )
     parser.add_argument(
         '--ollama-host',
