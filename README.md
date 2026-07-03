@@ -19,16 +19,35 @@ curl http://sn-1.vltgg.net:21800/api/tags
 
 ---
 
-## 👥 For GPU Donors
+## 👥 For Donors
 
-1. Install Ollama from https://ollama.ai
-2. Install Python from https://python.org
-3. Download any model of your choice with `ollama pull <model>`
-4. Install and run worker:
+Install Python from https://python.org, then `pip install -r requirements.txt`.
+The worker can donate several kinds of backend — pick whichever you have:
+
+**Local Ollama** (default)
 ```bash
-pip install -r requirements.txt
+ollama pull <model>          # download any model
 python worker/client.py
 ```
+
+**A llama.cpp server**
+```bash
+python worker/client.py --backend llamacpp --endpoint http://localhost:8080
+```
+
+**A hosted / custom OpenAI-compatible endpoint** (share an API key, a gateway,
+or any custom endpoint). You choose exactly which model names to expose, and
+the worker prompts for the key (hidden input) unless you pass `--api-key` /
+set `EDITORAI_WORKER_API_KEY`:
+```bash
+python worker/client.py --backend openai \
+    --endpoint https://api.example.com \
+    --models glm-4.7-flash,glm-4.5-flash
+```
+
+> **Your privacy:** the worker never sends your IP address to the coordinator.
+> The network is pull-based (your machine polls for work; the coordinator never
+> connects back), so your address is never needed, transmitted, or stored.
 
 ---
 
