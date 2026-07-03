@@ -227,7 +227,16 @@ class PlatinumWorker:
                     url = f"{self.coordinator_url}/api/workers/heartbeat"
                     async with s.post(url, json=data,
                                       timeout=aiohttp.ClientTimeout(total=5)) as r:
-                        if r.status != 200:
+                        # SELF-HEAL: a 404 means the coordinator restarted and
+                        # no longer knows us. Re-register instead of heart-
+                        # beating into the void forever (the old client just
+                        # warned and never came back, orphaning the worker on
+                        # every coordinator restart).
+                        if r.status == 404:
+                            logger.info("Coordinator forgot us (restarted?) - "
+                                        "re-registering...")
+                            await self.register_with_coordinator()
+                        elif r.status != 200:
                             logger.warning(f"Heartbeat HTTP {r.status}")
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
@@ -247,6 +256,14 @@ class PlatinumWorker:
                                 await self.process_work(work['request_id'], work)
                             else:
                                 await asyncio.sleep(2)
+                        elif r.status in (400, 404):
+                            # Unknown worker_id — coordinator restarted. The
+                            # heartbeat loop re-registers too, but do it here
+                            # as well so a work poll can't spin on 400s.
+                            logger.info("Coordinator doesn't know this worker "
+                                        "- re-registering...")
+                            await self.register_with_coordinator()
+                            await asyncio.sleep(3)
                         else:
                             logger.warning(f"Get work HTTP {r.status}")
                             await asyncio.sleep(5)
