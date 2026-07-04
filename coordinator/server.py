@@ -197,6 +197,11 @@ class CoordinatorServer:
         self.request_queue: Dict[str, QueuedRequest] = {}
         self.heartbeat_timeout = 30
         self.request_timeout = 300
+        # Restore the worker registry from the last run. Without this, a
+        # coordinator restart orphans every connected worker: old clients
+        # never re-register (their heartbeats just 404 forever), /api/tags
+        # goes empty, and the mod reports "no models available".
+        self._load_workers()
         
     async def register_worker(self, request: web.Request) -> web.Response:
         """Register a new worker node"""
@@ -229,7 +234,8 @@ class CoordinatorServer:
             )
             
             self.workers[worker_id] = worker
-            
+            self._save_workers()
+
             logger.info(f"Registered worker {worker_id}")
             logger.info(f"  VRAM: {resources.available_vram_gb:.1f}/{resources.total_vram_gb:.1f} GB")
             logger.info(f"  RAM: {resources.available_ram_gb:.1f}/{resources.total_ram_gb:.1f} GB")
@@ -286,6 +292,61 @@ class CoordinatorServer:
     
     FINAL_STATES = (RequestStatus.COMPLETED, RequestStatus.FAILED,
                     RequestStatus.TIMEOUT)
+
+    def _workers_path(self) -> str:
+        return os.path.join(os.environ.get('PLATINUM_DATA_DIR', '.'),
+                            'workers.json')
+
+    def _save_workers(self) -> None:
+        """Persist the worker registry so restarts don't orphan workers.
+
+        Addresses are redacted before touching disk — the network is
+        pull-based so they're never needed, and Platinum's privacy posture
+        is that no addresses are ever stored."""
+        try:
+            snap = []
+            for w in self.workers.values():
+                d = w.to_dict()
+                d['address'] = 'hidden'
+                d['status'] = WorkerStatus.IDLE.value
+                d['current_requests'] = 0
+                snap.append(d)
+            tmp = self._workers_path() + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(snap, f)
+            os.replace(tmp, self._workers_path())
+        except OSError as e:
+            logger.warning(f"Could not persist worker registry: {e}")
+
+    def _load_workers(self) -> None:
+        """Re-hydrate the registry saved by _save_workers. Restored workers
+        get a fresh heartbeat grace period; ones that really are gone go
+        OFFLINE in {heartbeat_timeout}s and are removed by the normal sweep."""
+        try:
+            with open(self._workers_path()) as f:
+                snap = json.load(f)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            logger.warning(f"Could not load worker registry: {e}")
+            return
+        now = datetime.now()
+        for d in snap:
+            try:
+                self.workers[d['id']] = Worker(
+                    id=d['id'],
+                    address=d.get('address', 'hidden'),
+                    port=d.get('port', 0),
+                    status=WorkerStatus.IDLE,
+                    resources=WorkerResources(**d['resources']),
+                    models=d.get('models', []),
+                    last_heartbeat=now,
+                    total_requests=d.get('total_requests', 0),
+                )
+            except (KeyError, TypeError) as e:
+                logger.warning(f"Skipping bad entry in workers.json: {e}")
+        if self.workers:
+            logger.info(f"Restored {len(self.workers)} worker(s) from {self._workers_path()}")
 
     def _model_online(self, model: str) -> bool:
         return any(
@@ -1073,6 +1134,8 @@ class CoordinatorServer:
                 for worker_id in to_remove:
                     del self.workers[worker_id]
                     logger.info(f"Removed worker {worker_id}")
+                if to_remove:
+                    self._save_workers()
                             
             except Exception as e:
                 logger.error(f"Error in cleanup: {e}")
