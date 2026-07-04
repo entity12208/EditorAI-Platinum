@@ -51,9 +51,12 @@ async def cors_middleware(request, handler):
             'Access-Control-Allow-Headers': 'Content-Type',
         })
     response = await handler(request)
-    response.headers['Access-Control-Allow-Origin']  = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    # A long-poll StreamResponse (blocking /api/generate) has already sent its
+    # headers by the time it returns here — sets its own CORS, skip it.
+    if not getattr(response, 'prepared', False):
+        response.headers['Access-Control-Allow-Origin']  = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return response
 
 
@@ -136,6 +139,10 @@ class QueuedRequest:
     fallback_chain: Optional[list] = None
     chain_index: int = 0
     chain_attempts: int = 0
+    # asyncio.Event set exactly once, when status reaches a final state
+    # (COMPLETED / FAILED / TIMEOUT). The blocking /api/generate long-poll
+    # waits on it instead of busy-polling the status.
+    waiter: Optional[object] = None
 
 
 # Fallback chains: (model, max_tries_before_moving_on) pairs.
@@ -158,6 +165,15 @@ FALLBACK_CHAINS = {
         ('JTA-GLM-EDITORAI', 2),
         ('glm-4.5-flash', 1),
         ('JTA-GLM-EDITORAI', 1),
+        ('entity12208/editorai:v2', 1),
+    ],
+    # Advertised by JTA donor workers as a literal model name; without this
+    # entry it resolved to a single-attempt chain with no fallback.
+    'best-available-jta': [
+        ('best-available-jta', 1),
+        ('JTA-GLM-EDITORAI', 2),
+        ('glm-4.5-flash', 1),
+        ('glm-4.7-flash', 1),
         ('entity12208/editorai:v2', 1),
     ],
     'glm-4.5-flash': [
@@ -268,59 +284,150 @@ class CoordinatorServer:
                 'message': str(e)
             }, status=400)
     
+    FINAL_STATES = (RequestStatus.COMPLETED, RequestStatus.FAILED,
+                    RequestStatus.TIMEOUT)
+
+    def _model_online(self, model: str) -> bool:
+        return any(
+            w.status != WorkerStatus.OFFLINE and model in w.models
+            for w in self.workers.values()
+        )
+
     async def queue_request(self, request: web.Request) -> web.Response:
-        """Queue a generation request"""
+        """Queue a generation request.
+
+        Two response modes, keyed on the Ollama `stream` flag in the body:
+
+        - stream: true  -> Ollama-compatible blocking mode. Hold the
+          connection, write an NDJSON keepalive line every ~10s while the
+          request runs, then one final line carrying the full result (or an
+          `error` field). This is what the EditorAI mod — and any real
+          Ollama client — expects from /api/generate. (Previously this
+          endpoint always answered with an instant queued-ack, which Ollama
+          clients read as a stream cut off before `done`.)
+        - stream absent/false -> the original instant
+          {'request_id', 'status': 'queued'} ack; the caller then polls
+          GET /api/result/{id} (the proxy and ollama.ps1 bridge flow).
+        """
         try:
             data = await request.json()
             model = data.get('model')
-            
+
             if not model:
                 return web.json_response({
                     'error': 'Model not specified'
                 }, status=400)
-            
-            available = any(
-                model in w.models and w.status != WorkerStatus.OFFLINE 
-                for w in self.workers.values()
-            )
-            
-            if not available:
+
+            # Resolve the fallback chain first so availability considers
+            # every model the request could run on, not just the alias.
+            chain = FALLBACK_CHAINS.get(model, [(model, 1)])
+
+            if not any(self._model_online(m) for m, _ in chain):
                 return web.json_response({
                     'error': f'No workers available for model {model}'
                 }, status=503)
-            
+
+            # Start at the first chain hop that actually has a live worker —
+            # otherwise the request would sit PENDING for the full timeout
+            # before ever reaching a servable model.
+            start_index = 0
+            for i, (m, _) in enumerate(chain):
+                if self._model_online(m):
+                    start_index = i
+                    break
+
             request_id = str(uuid.uuid4())
-            
-            # Resolve fallback chain
-            chain = FALLBACK_CHAINS.get(model, [(model, 1)])
-            first_model, _ = chain[0]
-            
+            first_model = chain[start_index][0]
+
             queued_req = QueuedRequest(
                 request_id=request_id,
                 model=first_model,
                 original_model=model,
                 fallback_chain=chain,
-                chain_index=0,
+                chain_index=start_index,
                 chain_attempts=0,
                 prompt=data.get('prompt', ''),
                 options=data.get('options', {}),
                 status=RequestStatus.PENDING,
-                created_at=datetime.now()
+                created_at=datetime.now(),
+                waiter=asyncio.Event()
             )
-            
+
             self.request_queue[request_id] = queued_req
             logger.info(f"Queued request {request_id} for model {first_model} (original: {model}, chain: {chain})")
-            
-            return web.json_response({
-                'request_id': request_id,
-                'status': 'queued'
-            })
-            
+
+            if not data.get('stream'):
+                return web.json_response({
+                    'request_id': request_id,
+                    'status': 'queued'
+                })
+
+            return await self._stream_until_done(request, queued_req)
+
         except Exception as e:
             logger.error(f"Error queuing request: {e}")
             return web.json_response({
                 'error': str(e)
             }, status=500)
+
+    async def _stream_until_done(self, request: web.Request,
+                                 req: QueuedRequest) -> web.StreamResponse:
+        """Ollama-style NDJSON long-poll for a queued request.
+
+        Keepalive lines are empty `response` chunks — Ollama clients
+        accumulate chunk text, so they are no-ops that only keep the
+        connection (and any middlebox on the way) from idling out."""
+        resp = web.StreamResponse()
+        resp.headers['Content-Type'] = 'application/x-ndjson'
+        # Middleware skips prepared responses, so set CORS here.
+        resp.headers['Access-Control-Allow-Origin']  = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        deadline = time.monotonic() + self.request_timeout
+        try:
+            await resp.prepare(request)
+            while req.status not in self.FINAL_STATES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    req.status = RequestStatus.TIMEOUT
+                    req.error = 'Request timed out'
+                    req.completed_at = datetime.now()
+                    logger.warning(f"Request {req.request_id} timed out in blocking /api/generate")
+                    break
+                try:
+                    await asyncio.wait_for(req.waiter.wait(),
+                                           timeout=min(10.0, remaining))
+                except asyncio.TimeoutError:
+                    await resp.write(b'{"response":"","done":false}\n')
+
+            if req.status == RequestStatus.COMPLETED:
+                out = dict(req.result) if isinstance(req.result, dict) \
+                    else {'response': str(req.result or '')}
+                out['done'] = True
+                out.setdefault('response', '')
+                out.setdefault('model', req.original_model or req.model)
+                out.setdefault('created_at', datetime.now().isoformat())
+            elif req.status == RequestStatus.TIMEOUT:
+                out = {
+                    'error': f'Platinum timed out after {self.request_timeout}s — '
+                             'workers may be busy or the upstream provider is slow. '
+                             'Try again in a minute.',
+                    'done': True,
+                }
+            else:
+                detail = (req.error or 'unknown error')[:400]
+                out = {
+                    'error': f'Platinum: every model in the fallback chain failed. '
+                             f'Last error: {detail}',
+                    'done': True,
+                }
+            await resp.write(json.dumps(out).encode('utf-8') + b'\n')
+            await resp.write_eof()
+        except (ConnectionResetError, ConnectionError) as e:
+            # Client gave up (its own timeout) — the request keeps running
+            # and the result stays available to /api/result pollers.
+            logger.info(f"Client disconnected while waiting on {req.request_id}: {e}")
+        return resp
     
     async def get_work(self, request: web.Request) -> web.Response:
         """Worker polls for available work"""
@@ -333,9 +440,23 @@ class CoordinatorServer:
                 }, status=400)
             
             worker = self.workers[worker_id]
-            
+            now = datetime.now()
+
             for req_id, req in self.request_queue.items():
-                if req.status == RequestStatus.PENDING and req.model in worker.models:
+                if req.status != RequestStatus.PENDING:
+                    continue
+                # Don't hand out requests whose client deadline has passed —
+                # they would just burn worker time (and upstream quota) on an
+                # answer nobody is waiting for.
+                if (now - req.created_at).total_seconds() > self.request_timeout:
+                    req.status = RequestStatus.TIMEOUT
+                    req.error = 'Request timed out'
+                    req.completed_at = now
+                    if req.waiter is not None:
+                        req.waiter.set()
+                    logger.warning(f"Request {req_id} expired in queue, not assigning")
+                    continue
+                if req.model in worker.models:
                     req.status = RequestStatus.PROCESSING
                     req.assigned_worker = worker_id
                     worker.status = WorkerStatus.BUSY
@@ -388,7 +509,14 @@ class CoordinatorServer:
                         # Move to next model in chain
                         req.chain_index += 1
                         req.chain_attempts = 0
-                    
+                        # Skip hops with no live worker — waiting on them
+                        # would strand the request until the timeout.
+                        while (req.chain_index < len(req.fallback_chain)
+                               and not self._model_online(req.fallback_chain[req.chain_index][0])):
+                            logger.info(f"Request {request_id}: skipping offline chain hop "
+                                        f"{req.fallback_chain[req.chain_index][0]}")
+                            req.chain_index += 1
+
                     if req.chain_index < len(req.fallback_chain):
                         next_model, _ = req.fallback_chain[req.chain_index]
                         req.model = next_model
@@ -404,8 +532,10 @@ class CoordinatorServer:
                 req.status = RequestStatus.COMPLETED
                 req.result = data.get('result', {})
                 logger.info(f"Request {request_id} completed")
-            
+
             req.completed_at = datetime.now()
+            if req.status in self.FINAL_STATES and req.waiter is not None:
+                req.waiter.set()
             
             if worker_id and worker_id in self.workers:
                 worker = self.workers[worker_id]
@@ -957,13 +1087,16 @@ class CoordinatorServer:
                 to_remove = []
                 
                 for req_id, req in self.request_queue.items():
-                    if req.status == RequestStatus.PROCESSING:
+                    if req.status in (RequestStatus.PROCESSING, RequestStatus.PENDING):
                         age = (now - req.created_at).total_seconds()
                         if age > self.request_timeout:
                             req.status = RequestStatus.TIMEOUT
                             req.error = "Request timed out"
+                            req.completed_at = now
+                            if req.waiter is not None:
+                                req.waiter.set()
                             logger.warning(f"Request {req_id} timed out")
-                            
+
                             if req.assigned_worker and req.assigned_worker in self.workers:
                                 worker = self.workers[req.assigned_worker]
                                 worker.current_requests = max(0, worker.current_requests - 1)

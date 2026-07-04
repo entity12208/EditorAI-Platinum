@@ -29,6 +29,10 @@ class OllamaProxy:
         try:
             self.request_count += 1
             data = await request.json()
+            # The proxy always uses the ack+poll flow (GET /api/result/{id}).
+            # stream:true would make the coordinator long-poll NDJSON at us
+            # instead of returning the request_id ack, so strip it here.
+            data['stream'] = False
             
             logger.info(f"Request #{self.request_count}: Generating with model '{data.get('model', 'unknown')}'")
             
