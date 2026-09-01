@@ -35,6 +35,7 @@ INLINE_CONFIG = {
     'HF_SYNC_MINUTES':    '10',     # commit interval in minutes
     'PLATINUM_DATA_DIR': '.',     # where train.jsonl / contributions/ live
     # 'PLATINUM_LOG': '',           # path for a persistent coordinator log
+    # 'PLATINUM_CHAINS': '',        # JSON file of extra/overriding fallback chains
 }
 for _key, _val in INLINE_CONFIG.items():
     if _val:
@@ -186,6 +187,69 @@ FALLBACK_CHAINS = {
 }
 
 
+def _normalise_chain(raw) -> Optional[list]:
+    """Accept ["a", "b"] or [["a", 2], ["b", 1]] or [{"model": "a",
+    "tries": 2}] and return the internal [(model, tries)] form."""
+    if not isinstance(raw, list) or not raw:
+        return None
+    chain = []
+    for hop in raw:
+        if isinstance(hop, str):
+            chain.append((hop, 1))
+        elif isinstance(hop, (list, tuple)) and hop:
+            model = str(hop[0])
+            tries = int(hop[1]) if len(hop) > 1 else 1
+            chain.append((model, max(1, tries)))
+        elif isinstance(hop, dict) and hop.get('model'):
+            chain.append((str(hop['model']),
+                          max(1, int(hop.get('tries', 1)))))
+        else:
+            return None
+    return chain or None
+
+
+def load_chain_overrides(path: str) -> Dict[str, list]:
+    """Read operator-defined fallback chains from a JSON file.
+
+    Optional (PLATINUM_CHAINS). Now that workers can advertise arbitrary tags
+    from arbitrary providers, an operator needs a way to define chains for
+    their own tags without editing this file. Anything defined here overrides
+    the built-in FALLBACK_CHAINS entry of the same name; everything else is
+    untouched, so the default behaviour is bit-for-bit unchanged when the
+    file is absent.
+
+    Example:
+      {
+        "best":     [["mygw/llama-3.1-70b", 2], ["deepseek-chat", 1]],
+        "cheapest": ["deepseek-chat", "fake-gpt-small"]
+      }
+    """
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        logger.info(f"PLATINUM_CHAINS={path} not found yet; using built-in chains")
+        return {}
+    except (OSError, ValueError) as e:
+        logger.error(f"Could not read chain overrides {path}: {e}")
+        return {}
+    if not isinstance(data, dict):
+        logger.error(f"{path}: expected a JSON object of tag -> chain")
+        return {}
+    out: Dict[str, list] = {}
+    for tag, raw in data.items():
+        chain = _normalise_chain(raw)
+        if chain is None:
+            logger.warning(f"{path}: ignoring bad chain for {tag!r}")
+            continue
+        out[str(tag)] = chain
+    if out:
+        logger.info(f"Loaded {len(out)} fallback chain override(s) from {path}")
+    return out
+
+
 class CoordinatorServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 8080):
         self._contrib_times = {}  # ip-hash -> [timestamps] for /api/contribute
@@ -197,11 +261,59 @@ class CoordinatorServer:
         self.request_queue: Dict[str, QueuedRequest] = {}
         self.heartbeat_timeout = 30
         self.request_timeout = 300
+        # Fallback chains: built-ins, optionally overridden/extended by a
+        # JSON file (PLATINUM_CHAINS) so operators can define chains over
+        # whatever tags their providers advertise. Absent file = old behaviour.
+        self.fallback_chains: Dict[str, list] = dict(FALLBACK_CHAINS)
+        self._chains_path = os.environ.get('PLATINUM_CHAINS', '')
+        self._chains_mtime: Optional[float] = None
+        self._reload_chains()
         # Restore the worker registry from the last run. Without this, a
         # coordinator restart orphans every connected worker: old clients
         # never re-register (their heartbeats just 404 forever), /api/tags
         # goes empty, and the mod reports "no models available".
         self._load_workers()
+
+    def _reload_chains(self) -> bool:
+        """(Re)apply chain overrides; returns True when something changed."""
+        if not self._chains_path:
+            return False
+        try:
+            stamp = os.stat(self._chains_path).st_mtime
+        except OSError:
+            return False
+        if stamp == self._chains_mtime:
+            return False
+        self._chains_mtime = stamp
+        overrides = load_chain_overrides(self._chains_path)
+        merged = dict(FALLBACK_CHAINS)
+        merged.update(overrides)
+        changed = merged != self.fallback_chains
+        self.fallback_chains = merged
+        return changed
+
+    def chain_for(self, model: str) -> list:
+        """The fallback chain for a requested tag.
+
+        Unknown tags get a single-hop chain — exactly what happened before —
+        so any tag a worker advertises is servable without configuration.
+
+        If a live worker advertises the requested tag LITERALLY but the named
+        chain doesn't start with it, the literal tag is prepended. Without
+        this, a provider that maps its own tag onto a chain alias (e.g. a
+        worker advertising `best`) would 503 even though it can serve the
+        request, because every hop of the built-in chain names a different
+        model. In production nothing advertises the alias names, so the
+        built-in chains behave exactly as before.
+        """
+        chain = self.fallback_chains.get(model)
+        if chain is None:
+            return [(model, 1)]
+        if chain[0][0] != model and self._model_online(model):
+            logger.info(f"Chain for {model!r}: a worker serves it directly, "
+                        "trying that first")
+            return [(model, 1)] + list(chain)
+        return chain
         
     async def register_worker(self, request: web.Request) -> web.Response:
         """Register a new worker node"""
@@ -381,7 +493,9 @@ class CoordinatorServer:
 
             # Resolve the fallback chain first so availability considers
             # every model the request could run on, not just the alias.
-            chain = FALLBACK_CHAINS.get(model, [(model, 1)])
+            # Hot-reloadable: operators can edit PLATINUM_CHAINS live.
+            self._reload_chains()
+            chain = self.chain_for(model)
 
             if not any(self._model_online(m) for m, _ in chain):
                 return web.json_response({

@@ -44,6 +44,9 @@ logs/
 # Config files (may contain sensitive data)
 config.local.json
 .env
+providers.json
+chains.json
+workers.json
 
 # Docker
 .docker/

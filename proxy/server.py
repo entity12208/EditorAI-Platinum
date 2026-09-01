@@ -246,12 +246,12 @@ requests to the distributed coordinator, making the entire cluster accessible
 via a single URL.
 
 Examples:
-  # Start proxy on default port (11434)
-  python proxy.py --coordinator http://coordinator.example.com:8080
-  
-  # Start on a different port
+  # Start proxy on default port (11434), talking to the public coordinator
+  python proxy.py
+
+  # Start on a different port / point at a different coordinator
   python proxy.py --coordinator http://coordinator.example.com:8080 --port 8080
-  
+
   # Make it publicly accessible
   python proxy.py --coordinator http://coordinator.example.com:8080 --host 0.0.0.0
 
@@ -259,11 +259,13 @@ After starting, you can use this proxy URL in EditorAI or any Ollama client:
   http://your-server-ip:11434
         """
     )
-    
+
     parser.add_argument(
         '--coordinator',
-        required=True,
-        help='Coordinator server URL (e.g., http://coordinator.example.com:8080)'
+        default=os.environ.get('PLATINUM_COORDINATOR',
+                               'http://sn-1.vltgg.net:21800'),
+        help='Coordinator server URL (default: http://sn-1.vltgg.net:21800, '
+             'or $PLATINUM_COORDINATOR)'
     )
     parser.add_argument(
         '--host',
