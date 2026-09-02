@@ -80,8 +80,8 @@ python worker/client.py add \
 `add` is idempotent — re-pasting a URL updates it instead of duplicating it.
 `models=` is only required for endpoints that can't be autodetected (the tool
 tells you which ones those are). Fields: a bare token is the key, or use
-`key=`, `key-env=`, `models=`, `header=`, `name=`, `style=`,
-`chat-path=`, `models-path=`, all optional and in any order.
+`key=`, `key-env=`, `models=`, `header=`, `name=`, `style=`, `chat-path=`,
+`models-path=`, `stream=false`, `retries=0` — all optional and in any order.
 
 For one endpoint at a time, or full control:
 
@@ -127,6 +127,19 @@ Useful flags for `provider add` / `provider edit`:
 | `--extra-body JSON` | merged into every request body |
 | `--no-qualify` | don't advertise `<provider>/<model>` aliases |
 | `--timeout` | per-request timeout (default 300s) |
+| `--stream` / `--no-stream` | stream from the endpoint (default on) vs wait for the whole reply |
+| `--retries N` | extra attempts on transient upstream failures (5xx/524/timeouts; default 2) |
+
+### Slow providers / gateway timeouts ("524 A timeout occurred")
+
+Some upstreams — especially Cloudflare-fronted proxies like `justwoker.icu` —
+kill long, idle connections after ~100s. The worker avoids this by
+**streaming** from the endpoint by default (tokens keep flowing, so the
+connection stays alive no matter how long generation takes), and it
+automatically falls back to plain requests if an endpoint rejects
+`stream=true`. Transient failures (`5xx`, `524`, connection resets, timeouts)
+are retried a couple of times with a short backoff before being reported, so a
+flaky gateway gets a second chance instead of failing the request outright.
 
 ### Inspecting and running
 

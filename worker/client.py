@@ -313,6 +313,16 @@ class Provider:
     qualify: bool = True         # also advertise "<name>/<model>" aliases
     enabled: bool = True
     timeout: int = 300
+    # Stream from the upstream instead of waiting for the whole reply. Many
+    # gateways (Cloudflare-fronted ones especially) time out a long, idle
+    # connection at ~100s ("524 A timeout occurred") — streaming keeps tokens
+    # flowing so the connection stays alive no matter how long generation
+    # takes. Automatically falls back to non-streaming if the endpoint
+    # rejects stream=true.
+    stream: bool = True
+    # Extra attempts on transient failures (5xx / 524 / timeouts / resets)
+    # before the request is reported as failed.
+    retries: int = 2
     extra_body: Dict[str, object] = field(default_factory=dict)
 
     # ── serialisation ───────────────────────────────────────────────────
@@ -336,6 +346,8 @@ class Provider:
             'qualify': self.qualify,
             'enabled': self.enabled,
             'timeout': self.timeout,
+            'stream': self.stream,
+            'retries': self.retries,
             'extra_body': dict(self.extra_body),
         }
 
@@ -371,6 +383,8 @@ class Provider:
             qualify=bool(d.get('qualify', True)),
             enabled=bool(d.get('enabled', True)),
             timeout=int(d.get('timeout') or 300),
+            stream=bool(d.get('stream', True)),
+            retries=max(0, int(d.get('retries', 2) or 0)),
             extra_body=dict(d.get('extra_body') or {}),
         )
 
@@ -542,6 +556,100 @@ def default_config_path() -> str:
     return os.path.join(base, 'editorai-platinum', 'providers.json')
 
 
+# Upstream failure modes.
+#
+# _TRANSIENT_STATUS: retryable infrastructure errors — gateways restarting,
+# rate limits, and proxy timeouts (Cloudflare "524 A timeout occurred", etc.).
+# _STREAM_UNSUPPORTED_STATUS: a 4xx from a stream=true request usually means
+# the endpoint doesn't stream; the worker retries that call without streaming.
+_TRANSIENT_STATUS = frozenset({
+    408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525,
+    527, 529, 530, 598, 599,
+})
+_STREAM_UNSUPPORTED_STATUS = frozenset({400, 404, 405, 406, 415, 422, 501})
+
+
+class _TransientError(RuntimeError):
+    """An upstream failure worth retrying (5xx, 524, timeouts, resets)."""
+
+
+class _StreamRejected(RuntimeError):
+    """The endpoint refused stream=true; retry the same call non-streaming."""
+
+
+def _parse_stream_body(raw: bytes, style: str):
+    """Parse a streamed body into (text, usage, extra, mode).
+
+    Handles three shapes:
+      sse    — `data: {...}` events (OpenAI, Anthropic)
+      ndjson — one JSON object per line (Ollama's native stream)
+      json   — a single plain JSON body: the endpoint ignored stream=true.
+    `mode` is 'json' in that last case; callers then parse `raw` normally."""
+    saw_data = False
+    json_objs = 0
+    text_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    usage = None
+    extra: Dict[str, object] = {}
+    event = None
+    for line in raw.decode('utf-8', errors='replace').splitlines():
+        line = line.strip()
+        if not line:
+            event = None
+            continue
+        if line.startswith('event:'):
+            event = line[len('event:'):].strip()
+            continue
+        if line.startswith('data:'):
+            saw_data = True
+            payload = line[len('data:'):].strip()
+        else:
+            payload = line
+        if payload == '[DONE]':
+            continue
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        json_objs += 1
+        if style == STYLE_OPENAI:
+            for choice in data.get('choices') or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get('delta') or {}
+                c = delta.get('content')
+                if isinstance(c, str) and c:
+                    text_parts.append(c)
+                r = delta.get('reasoning_content') or delta.get('reasoning')
+                if isinstance(r, str) and r:
+                    reasoning_parts.append(r)
+            if isinstance(data.get('usage'), dict):
+                usage = data['usage']
+        elif style == STYLE_ANTHROPIC:
+            t = data.get('type')
+            if t == 'content_block_delta':
+                delta = data.get('delta') or {}
+                if isinstance(delta.get('text'), str) and delta['text']:
+                    text_parts.append(delta['text'])
+            elif t == 'message_delta' and isinstance(data.get('usage'), dict):
+                usage = data['usage']
+        elif style == STYLE_OLLAMA:
+            r = data.get('response')
+            if isinstance(r, str) and r:
+                text_parts.append(r)
+            if data.get('done'):
+                for k in ('eval_count', 'prompt_eval_count',
+                          'total_duration', 'eval_duration', 'load_duration',
+                          'context'):
+                    if k in data:
+                        extra[k] = data[k]
+    mode = 'sse' if saw_data else ('ndjson' if json_objs > 1 else 'json')
+    text = ''.join(text_parts) or ''.join(reasoning_parts)
+    return text, usage, extra, mode
+
+
 class ProviderClient:
     """HTTP adapter: one instance per provider, speaks that provider's style."""
 
@@ -577,12 +685,47 @@ class ProviderClient:
         """Run one prompt. Always returns an Ollama-shaped result dict, i.e.
         {'model': ..., 'response': text, 'done': True} (plus whatever extra
         fields a real Ollama backend returned), so the coordinator, the proxy
-        and every existing client see the exact same protocol as before."""
+        and every existing client see the exact same protocol as before.
+
+        Retries transient upstream failures (5xx, Cloudflare "524 A timeout
+        occurred", connection resets, timeouts) with a short backoff, and
+        falls back to non-streaming when an endpoint rejects stream=true."""
+        attempts = 1 + max(0, int(self.p.retries or 0))
+        budget = max(60, int(self.p.timeout or 300))
+        start = time.monotonic()
+        for attempt in range(attempts):
+            try:
+                return await self._generate_once(session, model, prompt,
+                                                 options)
+            except _StreamRejected:
+                # Endpoint refused stream=true — ask once without it. Most
+                # such endpoints are plain-JSON, non-streaming services.
+                return await self._generate_once(session, model, prompt,
+                                                 options, force_no_stream=True)
+            except _TransientError as e:
+                # Don't burn the whole job budget on retries: only retry
+                # while we've used less than half the timeout and have
+                # attempts left.
+                if attempt >= attempts - 1 \
+                        or time.monotonic() - start > budget * 0.5:
+                    raise
+                wait = min(2.0 * (attempt + 1), 10.0)
+                logger.warning("[%s] transient failure (attempt %d/%d): %s; "
+                               "retrying in %.0fs",
+                               self.p.name, attempt + 1, attempts, e, wait)
+                await asyncio.sleep(wait)
+        raise RuntimeError(f"{self.p.name}: generation failed")
+
+    async def _generate_once(self, session, model, prompt, options,
+                             force_no_stream: bool = False) -> dict:
         if self.p.style == STYLE_OLLAMA:
-            return await self._generate_ollama(session, model, prompt, options)
+            return await self._generate_ollama(session, model, prompt,
+                                               options, force_no_stream)
         if self.p.style == STYLE_ANTHROPIC:
-            return await self._generate_anthropic(session, model, prompt, options)
-        return await self._generate_openai(session, model, prompt, options)
+            return await self._generate_anthropic(session, model, prompt,
+                                                  options, force_no_stream)
+        return await self._generate_openai(session, model, prompt, options,
+                                           force_no_stream)
 
     def _timeout(self) -> aiohttp.ClientTimeout:
         return aiohttp.ClientTimeout(total=max(5, int(self.p.timeout or 300)))
@@ -595,52 +738,152 @@ class ProviderClient:
                                 timeout=self._timeout()) as r:
             text = await r.text()
             if r.status != 200:
-                raise RuntimeError(f"{self.p.name} HTTP {r.status}: {text[:500]}")
+                if r.status in _TRANSIENT_STATUS:
+                    raise _TransientError(f"{self.p.name} HTTP {r.status}: "
+                                          f"{text[:300]}")
+                raise RuntimeError(f"{self.p.name} HTTP {r.status}: "
+                                   f"{text[:500]}")
             try:
                 return json.loads(text)
             except ValueError as e:
                 raise RuntimeError(f"{self.p.name}: non-JSON reply: "
                                    f"{text[:200]}") from e
 
-    async def _generate_ollama(self, session, model, prompt, options) -> dict:
-        body = {'model': model, 'prompt': prompt, 'stream': False,
+    async def _stream_post(self, session: aiohttp.ClientSession,
+                           body: dict) -> bytes:
+        """POST `body` and read the whole response incrementally.
+
+        Reading as bytes arrive (rather than waiting for the complete body)
+        keeps the connection alive past proxy idle timeouts like Cloudflare's
+        ~100s "524 A timeout occurred" — the whole point of streaming.
+
+        Raises:
+          _StreamRejected   endpoint returned a 4xx — likely stream unsupported
+          _TransientError   retryable failure (5xx / 524 / reset / timeout)
+          RuntimeError      anything else (auth errors, bad JSON)
+        """
+        url = self.p.chat_url()
+        total = max(60, int(self.p.timeout or 300))
+        timeout = aiohttp.ClientTimeout(total=total, sock_read=90)
+        try:
+            async with session.post(url, json=body,
+                                    headers=self.p.request_headers(),
+                                    params=self.p.query_params() or None,
+                                    timeout=timeout) as r:
+                if r.status != 200:
+                    text = await r.text()
+                    if r.status in _TRANSIENT_STATUS:
+                        raise _TransientError(f"{self.p.name} HTTP {r.status}: "
+                                              f"{text[:300]}")
+                    if r.status in _STREAM_UNSUPPORTED_STATUS:
+                        raise _StreamRejected(f"{self.p.name} HTTP {r.status} "
+                                              f"(stream): {text[:200]}")
+                    raise RuntimeError(f"{self.p.name} HTTP {r.status}: "
+                                       f"{text[:500]}")
+                chunks = bytearray()
+                async for chunk in r.content.iter_any():
+                    chunks.extend(chunk)
+                return bytes(chunks)
+        except (_StreamRejected, _TransientError):
+            raise
+        except aiohttp.ClientPayloadError as e:
+            raise _TransientError(f"{self.p.name}: connection cut short: {e}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            raise _TransientError(f"{self.p.name}: "
+                                  f"{type(e).__name__}: {e}") from e
+
+    async def _generate_ollama(self, session, model, prompt, options,
+                               force_no_stream: bool = False) -> dict:
+        use_stream = self.p.stream and not force_no_stream
+        body = {'model': model, 'prompt': prompt, 'stream': use_stream,
                 'options': options or {}}
         body.update(copy.deepcopy(self.p.extra_body))
-        data = await self._post(session, body)
-        # Already Ollama-shaped; pass through untouched (compat with the
-        # original single-backend worker, which forwarded the raw JSON).
-        return data
+        body['stream'] = use_stream
+        if not use_stream:
+            # Already Ollama-shaped; pass through untouched (compat with the
+            # original single-backend worker, which forwarded the raw JSON).
+            return await self._post(session, body)
+        raw = await self._stream_post(session, body)
+        text, _usage, extra, mode = _parse_stream_body(raw, STYLE_OLLAMA)
+        if mode == 'json':
+            # Endpoint ignored stream=true and returned a plain JSON body.
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                data = None
+            if isinstance(data, dict) and isinstance(data.get('response'), str):
+                return data
+            raise RuntimeError(f"{self.p.name}: bad ollama reply: {raw[:200]}")
+        out = {'model': model, 'response': text, 'done': True}
+        out.update(extra)
+        return out
 
-    async def _generate_openai(self, session, model, prompt, options) -> dict:
+    async def _generate_openai(self, session, model, prompt, options,
+                               force_no_stream: bool = False) -> dict:
+        use_stream = self.p.stream and not force_no_stream
         body = {
             'model': model,
             'messages': [{'role': 'user', 'content': prompt}],
-            'stream': False,
+            'stream': use_stream,
         }
         _apply_sampling(body, options, max_key='max_tokens')
         body.update(copy.deepcopy(self.p.extra_body))
-        data = await self._post(session, body)
-        text = _extract_openai_text(data)
+        body['stream'] = use_stream
+        if not use_stream:
+            data = await self._post(session, body)
+            text = _extract_openai_text(data)
+            out = {'model': model, 'response': text, 'done': True}
+            usage = data.get('usage') if isinstance(data, dict) else None
+            if isinstance(usage, dict):
+                out['prompt_eval_count'] = usage.get('prompt_tokens')
+                out['eval_count'] = usage.get('completion_tokens')
+            return out
+        raw = await self._stream_post(session, body)
+        text, usage, _extra, mode = _parse_stream_body(raw, STYLE_OPENAI)
+        if mode == 'json':
+            # Endpoint ignored stream=true; it's a normal chat-completions JSON.
+            data = json.loads(raw)
+            text = _extract_openai_text(data)
+            usage = data.get('usage') if isinstance(data, dict) else None
+        if not text:
+            raise RuntimeError(f"{self.p.name}: empty streaming reply "
+                               f"(no content deltas)")
         out = {'model': model, 'response': text, 'done': True}
-        usage = data.get('usage') if isinstance(data, dict) else None
         if isinstance(usage, dict):
             out['prompt_eval_count'] = usage.get('prompt_tokens')
             out['eval_count'] = usage.get('completion_tokens')
         return out
 
-    async def _generate_anthropic(self, session, model, prompt, options) -> dict:
+    async def _generate_anthropic(self, session, model, prompt, options,
+                                  force_no_stream: bool = False) -> dict:
+        use_stream = self.p.stream and not force_no_stream
         body = {
             'model': model,
             'messages': [{'role': 'user', 'content': prompt}],
             'max_tokens': 4096,
-            'stream': False,
+            'stream': use_stream,
         }
         _apply_sampling(body, options, max_key='max_tokens')
         body.update(copy.deepcopy(self.p.extra_body))
-        data = await self._post(session, body)
-        text = _extract_anthropic_text(data)
+        body['stream'] = use_stream
+        if not use_stream:
+            data = await self._post(session, body)
+            text = _extract_anthropic_text(data)
+            out = {'model': model, 'response': text, 'done': True}
+            usage = data.get('usage') if isinstance(data, dict) else None
+            if isinstance(usage, dict):
+                out['prompt_eval_count'] = usage.get('input_tokens')
+                out['eval_count'] = usage.get('output_tokens')
+            return out
+        raw = await self._stream_post(session, body)
+        text, usage, _extra, mode = _parse_stream_body(raw, STYLE_ANTHROPIC)
+        if mode == 'json':
+            data = json.loads(raw)
+            text = _extract_anthropic_text(data)
+            usage = data.get('usage') if isinstance(data, dict) else None
+        if not text:
+            raise RuntimeError(f"{self.p.name}: empty streaming reply")
         out = {'model': model, 'response': text, 'done': True}
-        usage = data.get('usage') if isinstance(data, dict) else None
         if isinstance(usage, dict):
             out['prompt_eval_count'] = usage.get('input_tokens')
             out['eval_count'] = usage.get('output_tokens')
@@ -954,6 +1197,9 @@ Fields (all optional, any order, `|` also works as a separator):
   style=STYLE         openai | ollama | anthropic (default: guessed)
   chat-path=/p        override the generation path
   models-path=/p      override the model-listing path ('-' = none)
+  stream=false        don't stream (default: streaming on, avoids proxy
+                      idle timeouts like Cloudflare 524)
+  retries=0           disable retries on transient upstream failures
 Anything you leave out is worked out automatically: the API style is guessed
 from the URL, and the model list is autodetected from the endpoint. Only
 endpoints that can't be autodetected need models=.
@@ -1000,6 +1246,7 @@ def parse_bulk_line(line: str, taken) -> Tuple[Optional[Provider], str, set]:
             return None, f"{fields[0]!r} does not look like a URL", set()
 
     name = key = key_env = style = chat_path = models_path = ''
+    p_stream = p_retries = ''
     models_spec = ''
     headers: List[str] = []
     provided: set = set()
@@ -1041,6 +1288,12 @@ def parse_bulk_line(line: str, taken) -> Tuple[Optional[Provider], str, set]:
         elif f in ('models-path', 'modelspath'):
             models_path = value
             provided.add('models-path')
+        elif f in ('stream', 'no-stream', 'nostream'):
+            p_stream = value
+            provided.add('stream')
+        elif f == 'retries':
+            p_retries = value
+            provided.add('retries')
         elif not key and low.count('=') == 0:
             key = tok
             provided.add('key')
@@ -1075,6 +1328,13 @@ def parse_bulk_line(line: str, taken) -> Tuple[Optional[Provider], str, set]:
             p.models = _parse_maps([models_spec])
         except SystemExit as e:
             return None, str(e), provided
+    if 'stream' in provided:
+        p.stream = str(p_stream).strip().lower() not in ('0', 'false', 'no', 'off')
+    if 'retries' in provided:
+        try:
+            p.retries = max(0, int(p_retries))
+        except ValueError:
+            return None, f"bad retries value {p_retries!r}", provided
     # Autodetect whenever the operator didn't pin models and the endpoint has
     # somewhere to ask. models= is therefore only needed when detection fails.
     p.autodetect = not p.models and p.models_url() is not None
@@ -1258,6 +1518,10 @@ def _merge_into_existing(existing: Provider, new: Provider,
         existing.models_path = new.models_path
     if 'headers' in provided:
         existing.headers.update(new.headers)
+    if 'stream' in provided:
+        existing.stream = new.stream
+    if 'retries' in provided:
+        existing.retries = new.retries
     if 'models' in provided:
         existing.models = new.models
         existing.autodetect = new.autodetect
@@ -1333,6 +1597,12 @@ def _apply_common(p: Provider, args, store: ProviderStore) -> None:
         p.qualify = True
     if getattr(args, 'no_qualify', False):
         p.qualify = False
+    if getattr(args, 'stream', False):
+        p.stream = True
+    if getattr(args, 'no_stream', False):
+        p.stream = False
+    if getattr(args, 'retries', None) is not None:
+        p.retries = max(0, int(args.retries))
     maps = _parse_maps(getattr(args, 'map', None))
     if maps:
         if getattr(args, 'replace_maps', False):
@@ -1765,6 +2035,14 @@ def _add_provider_flags(sp, editing: bool) -> None:
                     help="Don't advertise '<provider>/<model>' aliases")
     sp.add_argument('--timeout', type=int,
                     help='Per-request timeout in seconds (default 300)')
+    sp.add_argument('--stream', action='store_true',
+                    help='Stream from the endpoint (default) — avoids proxy '
+                         'idle timeouts on long generations')
+    sp.add_argument('--no-stream', action='store_true',
+                    help='Wait for the whole reply instead of streaming')
+    sp.add_argument('--retries', type=int, metavar='N',
+                    help='Extra attempts on transient upstream failures '
+                         '(5xx/524/timeouts; default 2)')
     sp.add_argument('--extra-body', metavar='JSON',
                     help='JSON object merged into every request body')
     sp.add_argument('--ask-key', action='store_true',
