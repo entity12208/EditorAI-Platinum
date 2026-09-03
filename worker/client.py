@@ -681,7 +681,7 @@ class ProviderClient:
 
     # ── generation ──────────────────────────────────────────────────────
     async def generate(self, session: aiohttp.ClientSession, model: str,
-                       prompt: str, options: dict) -> dict:
+                       prompt: str, options: dict, on_progress=None) -> dict:
         """Run one prompt. Always returns an Ollama-shaped result dict, i.e.
         {'model': ..., 'response': text, 'done': True} (plus whatever extra
         fields a real Ollama backend returned), so the coordinator, the proxy
@@ -696,7 +696,8 @@ class ProviderClient:
         for attempt in range(attempts):
             try:
                 return await self._generate_once(session, model, prompt,
-                                                 options)
+                                                 options,
+                                                 on_progress=on_progress)
             except _StreamRejected:
                 # Endpoint refused stream=true — ask once without it. Most
                 # such endpoints are plain-JSON, non-streaming services.
@@ -717,15 +718,18 @@ class ProviderClient:
         raise RuntimeError(f"{self.p.name}: generation failed")
 
     async def _generate_once(self, session, model, prompt, options,
-                             force_no_stream: bool = False) -> dict:
+                             force_no_stream: bool = False,
+                             on_progress=None) -> dict:
         if self.p.style == STYLE_OLLAMA:
             return await self._generate_ollama(session, model, prompt,
-                                               options, force_no_stream)
+                                               options, force_no_stream,
+                                               on_progress)
         if self.p.style == STYLE_ANTHROPIC:
             return await self._generate_anthropic(session, model, prompt,
-                                                  options, force_no_stream)
+                                                  options, force_no_stream,
+                                                  on_progress)
         return await self._generate_openai(session, model, prompt, options,
-                                           force_no_stream)
+                                           force_no_stream, on_progress)
 
     def _timeout(self) -> aiohttp.ClientTimeout:
         return aiohttp.ClientTimeout(total=max(5, int(self.p.timeout or 300)))
@@ -750,12 +754,17 @@ class ProviderClient:
                                    f"{text[:200]}") from e
 
     async def _stream_post(self, session: aiohttp.ClientSession,
-                           body: dict) -> bytes:
+                           body: dict, on_text=None,
+                           style: Optional[str] = None) -> bytes:
         """POST `body` and read the whole response incrementally.
 
         Reading as bytes arrive (rather than waiting for the complete body)
         keeps the connection alive past proxy idle timeouts like Cloudflare's
         ~100s "524 A timeout occurred" — the whole point of streaming.
+
+        `on_text` (async, optional) is called with the text generated so far
+        as tokens arrive, throttled to a few times a second. The worker uses
+        it to forward live progress to the coordinator.
 
         Raises:
           _StreamRejected   endpoint returned a 4xx — likely stream unsupported
@@ -781,8 +790,24 @@ class ProviderClient:
                     raise RuntimeError(f"{self.p.name} HTTP {r.status}: "
                                        f"{text[:500]}")
                 chunks = bytearray()
+                last_report = 0.0
                 async for chunk in r.content.iter_any():
                     chunks.extend(chunk)
+                    if on_text is None:
+                        continue
+                    now = time.monotonic()
+                    if now - last_report < 0.4:
+                        continue
+                    last_report = now
+                    # Re-parsing the buffer is cheap at reply sizes we see,
+                    # and keeps this adapter free of per-style stream state.
+                    text, _u, _e, mode = _parse_stream_body(
+                        bytes(chunks), style or self.p.style)
+                    if mode != 'json' and text:
+                        try:
+                            await on_text(text)
+                        except Exception as e:      # progress is best-effort
+                            logger.debug("progress callback failed: %s", e)
                 return bytes(chunks)
         except (_StreamRejected, _TransientError):
             raise
@@ -793,7 +818,8 @@ class ProviderClient:
                                   f"{type(e).__name__}: {e}") from e
 
     async def _generate_ollama(self, session, model, prompt, options,
-                               force_no_stream: bool = False) -> dict:
+                               force_no_stream: bool = False,
+                               on_progress=None) -> dict:
         use_stream = self.p.stream and not force_no_stream
         body = {'model': model, 'prompt': prompt, 'stream': use_stream,
                 'options': options or {}}
@@ -803,7 +829,8 @@ class ProviderClient:
             # Already Ollama-shaped; pass through untouched (compat with the
             # original single-backend worker, which forwarded the raw JSON).
             return await self._post(session, body)
-        raw = await self._stream_post(session, body)
+        raw = await self._stream_post(session, body, on_progress,
+                                      STYLE_OLLAMA)
         text, _usage, extra, mode = _parse_stream_body(raw, STYLE_OLLAMA)
         if mode == 'json':
             # Endpoint ignored stream=true and returned a plain JSON body.
@@ -819,7 +846,8 @@ class ProviderClient:
         return out
 
     async def _generate_openai(self, session, model, prompt, options,
-                               force_no_stream: bool = False) -> dict:
+                               force_no_stream: bool = False,
+                               on_progress=None) -> dict:
         use_stream = self.p.stream and not force_no_stream
         body = {
             'model': model,
@@ -838,7 +866,8 @@ class ProviderClient:
                 out['prompt_eval_count'] = usage.get('prompt_tokens')
                 out['eval_count'] = usage.get('completion_tokens')
             return out
-        raw = await self._stream_post(session, body)
+        raw = await self._stream_post(session, body, on_progress,
+                                      STYLE_OPENAI)
         text, usage, _extra, mode = _parse_stream_body(raw, STYLE_OPENAI)
         if mode == 'json':
             # Endpoint ignored stream=true; it's a normal chat-completions JSON.
@@ -855,7 +884,8 @@ class ProviderClient:
         return out
 
     async def _generate_anthropic(self, session, model, prompt, options,
-                                  force_no_stream: bool = False) -> dict:
+                                  force_no_stream: bool = False,
+                                  on_progress=None) -> dict:
         use_stream = self.p.stream and not force_no_stream
         body = {
             'model': model,
@@ -875,7 +905,8 @@ class ProviderClient:
                 out['prompt_eval_count'] = usage.get('input_tokens')
                 out['eval_count'] = usage.get('output_tokens')
             return out
-        raw = await self._stream_post(session, body)
+        raw = await self._stream_post(session, body, on_progress,
+                                      STYLE_ANTHROPIC)
         text, usage, _extra, mode = _parse_stream_body(raw, STYLE_ANTHROPIC)
         if mode == 'json':
             data = json.loads(raw)
@@ -2248,6 +2279,10 @@ class PlatinumWorker:
         self._config_mtime: Optional[float] = None
         self.registry = ModelRegistry()
         self._advertised: List[str] = []
+        # Live token streaming to the coordinator (POST /api/progress/{id}).
+        # Turned off automatically the first time a coordinator says it has
+        # no such route, so this worker still works against old coordinators.
+        self._progress_supported = True
         self._session: Optional[aiohttp.ClientSession] = None
 
         if providers is not None:
@@ -2515,8 +2550,9 @@ class PlatinumWorker:
                     f"{route.provider.name}:{route.model}")
         started = time.monotonic()
         try:
-            result = await route.client.generate(self.session(), route.model,
-                                                 prompt, options)
+            result = await route.client.generate(
+                self.session(), route.model, prompt, options,
+                on_progress=self._progress_reporter(request_id))
             # Answer under the tag the network asked for, not the upstream
             # name — clients match on what they requested.
             if isinstance(result, dict):
@@ -2534,6 +2570,42 @@ class PlatinumWorker:
         except Exception as e:
             logger.error(f"Error on {request_id}: {e}")
             await self.submit_error(request_id, str(e))
+
+    def _progress_reporter(self, request_id: str):
+        """Build an async callback that forwards live text to the coordinator.
+
+        This is what lets a client watching /api/generate see tokens appear as
+        they are generated. It is entirely best-effort and additive:
+
+          - an older coordinator answers 404, and we stop reporting for the
+            rest of this run (no retries, no log spam);
+          - any network error is ignored — the authoritative result still goes
+            through /api/result/{id} exactly as before.
+        """
+        if not self._progress_supported:
+            return None
+
+        async def report(text: str) -> None:
+            if not self._progress_supported:
+                return
+            url = f"{self.coordinator_url}/api/progress/{request_id}"
+            try:
+                async with self.session().post(
+                        url, json={'worker_id': self.worker_id, 'text': text},
+                        timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status == 404:
+                        # Could be an old coordinator (no such route) or a
+                        # request it has already finalised. Only give up for
+                        # good on the former.
+                        body = (await r.text())[:120]
+                        if 'Request not found' not in body:
+                            self._progress_supported = False
+                            logger.info("Coordinator has no /api/progress "
+                                        "endpoint - live token streaming off")
+            except Exception as e:
+                logger.debug("progress post failed: %s", e)
+
+        return report
 
     async def submit_result(self, request_id: str, result: dict):
         try:

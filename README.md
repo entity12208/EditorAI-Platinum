@@ -25,6 +25,11 @@ curl http://sn-1.vltgg.net:21801/api/generate \
   -d '{"model":"best","prompt":"hello","stream":true}'
 ```
 
+`stream: true` streams tokens as NDJSON, one chunk per piece of text, ending
+with `{"done": true}` — the same shape real Ollama uses, so any Ollama client
+that accumulates chunks works. Omit `stream` (or send `false`) to get a single
+buffered JSON object instead.
+
 ---
 
 ## 👥 For Donors
@@ -140,6 +145,13 @@ automatically falls back to plain requests if an endpoint rejects
 `stream=true`. Transient failures (`5xx`, `524`, connection resets, timeouts)
 are retried a couple of times with a short backoff before being reported, so a
 flaky gateway gets a second chance instead of failing the request outright.
+
+Those tokens are also forwarded live: while generating, the worker reports
+progress to the coordinator (`POST /api/progress/{id}`), which relays it to
+whoever is waiting on `/api/generate` with `stream: true`. Workers and
+coordinators that predate this still interoperate — an old worker simply
+reports no progress, and the stream falls back to keepalives plus one final
+line with the whole answer.
 
 ### Inspecting and running
 

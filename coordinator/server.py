@@ -144,6 +144,13 @@ class QueuedRequest:
     # (COMPLETED / FAILED / TIMEOUT). The blocking /api/generate long-poll
     # waits on it instead of busy-polling the status.
     waiter: Optional[object] = None
+    # Live token stream. Workers that support it POST incremental text to
+    # /api/progress/{id} while generating; the blocking /api/generate
+    # long-poll forwards each new piece as an Ollama NDJSON chunk. Old
+    # workers never post, in which case `partial` stays empty and the
+    # long-poll behaves exactly as it always did (keepalives + one final
+    # line carrying the whole answer).
+    partial: str = ''
 
 
 # Fallback chains: (model, max_tries_before_moving_on) pairs.
@@ -545,13 +552,54 @@ class CoordinatorServer:
                 'error': str(e)
             }, status=500)
 
+    async def submit_progress(self, request: web.Request) -> web.Response:
+        """Worker reports text generated so far (live token streaming).
+
+        Optional and additive: workers that don't call this still work, and a
+        worker calling it against an older coordinator just gets a 404 and
+        stops. Only the still-running request's `partial` buffer is touched —
+        the final result still arrives through /api/result/{id}, so the
+        completion path and the stored result are unchanged."""
+        try:
+            request_id = request.match_info.get('request_id')
+            req = self.request_queue.get(request_id)
+            if req is None:
+                return web.json_response({'error': 'Request not found'},
+                                         status=404)
+            if req.status in self.FINAL_STATES:
+                return web.json_response({'status': 'ignored'})
+            data = await request.json()
+            # Accept either the whole text so far (`text`) or an increment
+            # (`delta`), so workers can use whichever is cheaper.
+            if isinstance(data.get('text'), str):
+                whole = data['text']
+                # Guard against out-of-order posts: never shrink the buffer.
+                if len(whole) > len(req.partial):
+                    req.partial = whole
+            elif isinstance(data.get('delta'), str):
+                req.partial += data['delta']
+            return web.json_response({'status': 'success'})
+        except (ValueError, json.JSONDecodeError):
+            return web.json_response({'error': 'bad json'}, status=400)
+        except Exception as e:
+            logger.error(f"Error accepting progress: {e}")
+            return web.json_response({'error': str(e)}, status=500)
+
     async def _stream_until_done(self, request: web.Request,
                                  req: QueuedRequest) -> web.StreamResponse:
         """Ollama-style NDJSON long-poll for a queued request.
 
-        Keepalive lines are empty `response` chunks — Ollama clients
-        accumulate chunk text, so they are no-ops that only keep the
-        connection (and any middlebox on the way) from idling out."""
+        Forwards live tokens when the assigned worker reports them (see
+        submit_progress), so a client sees text appear as it is generated —
+        exactly how real Ollama streams. Whatever happens, the chunks an
+        Ollama client accumulates add up to the complete answer once and only
+        once: the final line carries only the not-yet-sent tail.
+
+        With a worker that doesn't report progress, nothing is available to
+        forward, so this degrades to the previous behaviour — empty keepalive
+        chunks (which accumulate to nothing) plus a final line holding the
+        whole answer.
+        """
         resp = web.StreamResponse()
         resp.headers['Content-Type'] = 'application/x-ndjson'
         # Middleware skips prepared responses, so set CORS here.
@@ -559,8 +607,11 @@ class CoordinatorServer:
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
         deadline = time.monotonic() + self.request_timeout
+        streamed = ''       # exactly what has already been written downstream
+        model_name = req.original_model or req.model
         try:
             await resp.prepare(request)
+            idle = 0.0
             while req.status not in self.FINAL_STATES:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -570,9 +621,30 @@ class CoordinatorServer:
                     logger.warning(f"Request {req.request_id} timed out in blocking /api/generate")
                     break
                 try:
+                    # Poll often so tokens are forwarded promptly; the waiter
+                    # still wakes us instantly on completion.
                     await asyncio.wait_for(req.waiter.wait(),
-                                           timeout=min(10.0, remaining))
+                                           timeout=min(0.5, remaining))
                 except asyncio.TimeoutError:
+                    pass
+                # Forward only text we haven't sent yet. A fallback attempt
+                # resets req.partial, so compare against what we streamed.
+                if req.partial.startswith(streamed) and len(req.partial) > len(streamed):
+                    chunk = req.partial[len(streamed):]
+                    streamed += chunk
+                    idle = 0.0
+                    await resp.write(json.dumps({
+                        'model': model_name,
+                        'created_at': datetime.now().isoformat(),
+                        'response': chunk,
+                        'done': False,
+                    }).encode('utf-8') + b'\n')
+                    continue
+                idle += 0.5
+                if idle >= 10.0:
+                    # Keepalive: an empty chunk accumulates to nothing but
+                    # stops idle proxies from dropping the connection.
+                    idle = 0.0
                     await resp.write(b'{"response":"","done":false}\n')
 
             if req.status == RequestStatus.COMPLETED:
@@ -580,8 +652,17 @@ class CoordinatorServer:
                     else {'response': str(req.result or '')}
                 out['done'] = True
                 out.setdefault('response', '')
-                out.setdefault('model', req.original_model or req.model)
+                out.setdefault('model', model_name)
                 out.setdefault('created_at', datetime.now().isoformat())
+                # Send only the tail we haven't streamed, so a client that
+                # accumulates chunks ends up with the answer exactly once. If
+                # the streamed text isn't a prefix of the final answer (a
+                # fallback model answered after we streamed some of a failed
+                # attempt), send it whole rather than lose any of it.
+                full = out.get('response') or ''
+                if streamed:
+                    out['response'] = full[len(streamed):] \
+                        if full.startswith(streamed) else full
             elif req.status == RequestStatus.TIMEOUT:
                 out = {
                     'error': f'Platinum timed out after {self.request_timeout}s — '
@@ -697,6 +778,9 @@ class CoordinatorServer:
                         req.model = next_model
                         req.status = RequestStatus.PENDING
                         req.assigned_worker = None
+                        # Drop any tokens the failed attempt streamed — the
+                        # next model starts its answer from scratch.
+                        req.partial = ''
                         logger.info(f"Re-queued request {request_id} for model {next_model} (chain index {req.chain_index}, chain attempts {req.chain_attempts})")
                     else:
                         req.status = RequestStatus.FAILED
@@ -1337,6 +1421,7 @@ class CoordinatorServer:
         app.router.add_get('/api/work', self.get_work)
         app.router.add_post('/api/result/{request_id}', self.submit_result)
         app.router.add_get('/api/result/{request_id}', self.get_result)
+        app.router.add_post('/api/progress/{request_id}', self.submit_progress)
         app.router.add_get('/api/tags', self.list_models)
         app.router.add_get('/api/status', self.get_status)
         app.router.add_get('/health', self.health)
@@ -1359,6 +1444,7 @@ class CoordinatorServer:
         logger.info("  POST /api/generate")
         logger.info("  GET  /api/work")
         logger.info("  POST /api/result/{id}")
+        logger.info("  POST /api/progress/{id}")
         logger.info("  GET  /api/result/{id}")
         logger.info("  GET  /api/tags")
         logger.info("  GET  /api/status")

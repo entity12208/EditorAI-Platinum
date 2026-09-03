@@ -6,7 +6,9 @@ This makes the distributed Ollama cluster accessible via a single public endpoin
 """
 
 import asyncio
+import json
 import logging
+import os
 from aiohttp import web, ClientSession, ClientTimeout
 import argparse
 
@@ -25,17 +27,83 @@ class OllamaProxy:
         self.request_count = 0
         
     async def proxy_generate(self, request: web.Request) -> web.Response:
-        """Proxy /api/generate requests to coordinator using queue system"""
+        """Proxy /api/generate to the coordinator.
+
+        Two modes, keyed on the Ollama `stream` flag, matching what the
+        coordinator itself does:
+
+        - stream: true  -> pipe the coordinator's NDJSON straight through, so
+          the caller sees tokens as they are generated (real Ollama
+          behaviour). Previously the proxy stripped the flag and answered with
+          one buffered JSON object, which is why nothing ever streamed
+          through this port.
+        - stream absent/false -> the original buffered single JSON object
+          (queue, then poll GET /api/result/{id}), unchanged.
+        """
         try:
-            self.request_count += 1
             data = await request.json()
-            # The proxy always uses the ack+poll flow (GET /api/result/{id}).
+        except Exception as e:
+            return web.json_response({'error': f'bad json: {e}'}, status=400)
+
+        self.request_count += 1
+        logger.info(f"Request #{self.request_count}: Generating with model "
+                    f"'{data.get('model', 'unknown')}'"
+                    f"{' (streaming)' if data.get('stream') else ''}")
+
+        if data.get('stream'):
+            return await self._proxy_stream(request, data)
+        return await self._proxy_buffered(data)
+
+    async def _proxy_stream(self, request: web.Request,
+                            data: dict) -> web.StreamResponse:
+        """Pass the coordinator's NDJSON token stream through untouched."""
+        url = f"{self.coordinator_url}/api/generate"
+        resp = None
+        try:
+            async with ClientSession() as session:
+                async with session.post(
+                        url, json=data,
+                        timeout=ClientTimeout(total=None, sock_connect=60,
+                                              sock_read=120)) as upstream:
+                    if upstream.status != 200:
+                        body = await upstream.text()
+                        logger.error(f"Request #{self.request_count}: "
+                                     f"coordinator HTTP {upstream.status}")
+                        return web.json_response(
+                            {'error': body[:500] or 'coordinator error'},
+                            status=upstream.status)
+                    resp = web.StreamResponse()
+                    resp.headers['Content-Type'] = 'application/x-ndjson'
+                    resp.headers['Access-Control-Allow-Origin'] = '*'
+                    resp.headers['Access-Control-Allow-Methods'] = \
+                        'GET, POST, OPTIONS'
+                    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+                    await resp.prepare(request)
+                    async for chunk in upstream.content.iter_any():
+                        await resp.write(chunk)
+                    await resp.write_eof()
+                    logger.info(f"Request #{self.request_count}: stream done")
+                    return resp
+        except Exception as e:
+            logger.error(f"Request #{self.request_count}: stream error - {e}")
+            if resp is not None and resp.prepared:
+                # Headers already sent: close with an Ollama-shaped error line.
+                try:
+                    await resp.write(json.dumps({'error': str(e),
+                                                 'done': True}).encode() + b'\n')
+                    await resp.write_eof()
+                except Exception:
+                    pass
+                return resp
+            return web.json_response({'error': str(e)}, status=502)
+
+    async def _proxy_buffered(self, data: dict) -> web.Response:
+        """Original queue + poll flow, returning one Ollama result object."""
+        try:
             # stream:true would make the coordinator long-poll NDJSON at us
-            # instead of returning the request_id ack, so strip it here.
+            # instead of returning the request_id ack, so keep it off here.
             data['stream'] = False
-            
-            logger.info(f"Request #{self.request_count}: Generating with model '{data.get('model', 'unknown')}'")
-            
+
             async with ClientSession() as session:
                 # Step 1: Queue the request - retry up to 5 times to handle
                 # coordinator waking up from Render free tier sleep (~30s)
