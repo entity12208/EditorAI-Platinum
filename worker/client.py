@@ -568,6 +568,10 @@ _TRANSIENT_STATUS = frozenset({
 })
 _STREAM_UNSUPPORTED_STATUS = frozenset({400, 404, 405, 406, 415, 422, 501})
 
+# How often the worker forwards generated-so-far text to the coordinator.
+# ~4 updates/sec reads as live streaming without hammering the coordinator.
+_PROGRESS_INTERVAL = 0.25
+
 
 class _TransientError(RuntimeError):
     """An upstream failure worth retrying (5xx, 524, timeouts, resets)."""
@@ -796,7 +800,7 @@ class ProviderClient:
                     if on_text is None:
                         continue
                     now = time.monotonic()
-                    if now - last_report < 0.4:
+                    if now - last_report < _PROGRESS_INTERVAL:
                         continue
                     last_report = now
                     # Re-parsing the buffer is cheap at reply sizes we see,
@@ -2549,15 +2553,23 @@ class PlatinumWorker:
         logger.info(f"Processing {request_id}: {tag} -> "
                     f"{route.provider.name}:{route.model}")
         started = time.monotonic()
+        report = self._progress_reporter(request_id)
         try:
             result = await route.client.generate(
                 self.session(), route.model, prompt, options,
-                on_progress=self._progress_reporter(request_id))
+                on_progress=report)
             # Answer under the tag the network asked for, not the upstream
             # name — clients match on what they requested.
             if isinstance(result, dict):
                 result.setdefault('done', True)
                 result['model'] = tag or result.get('model') or route.model
+            # Flush the complete text before the result lands, so the
+            # coordinator has streamed everything and its final NDJSON line
+            # carries an empty `response` — exactly like real Ollama.
+            if report is not None and isinstance(result, dict) \
+                    and isinstance(result.get('response'), str) \
+                    and result['response']:
+                await report(result['response'])
             took = time.monotonic() - started
             logger.info(f"{request_id}: done in {took:.1f}s via "
                         f"{route.provider.name}")

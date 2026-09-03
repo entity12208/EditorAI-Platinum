@@ -412,6 +412,10 @@ class CoordinatorServer:
     FINAL_STATES = (RequestStatus.COMPLETED, RequestStatus.FAILED,
                     RequestStatus.TIMEOUT)
 
+    # How often the blocking /api/generate long-poll checks for new tokens.
+    # Small enough that output feels live, large enough to stay cheap.
+    STREAM_POLL = 0.2
+
     def _workers_path(self) -> str:
         return os.path.join(os.environ.get('PLATINUM_DATA_DIR', '.'),
                             'workers.json')
@@ -624,7 +628,8 @@ class CoordinatorServer:
                     # Poll often so tokens are forwarded promptly; the waiter
                     # still wakes us instantly on completion.
                     await asyncio.wait_for(req.waiter.wait(),
-                                           timeout=min(0.5, remaining))
+                                           timeout=min(self.STREAM_POLL,
+                                                       remaining))
                 except asyncio.TimeoutError:
                     pass
                 # Forward only text we haven't sent yet. A fallback attempt
@@ -640,7 +645,7 @@ class CoordinatorServer:
                         'done': False,
                     }).encode('utf-8') + b'\n')
                     continue
-                idle += 0.5
+                idle += self.STREAM_POLL
                 if idle >= 10.0:
                     # Keepalive: an empty chunk accumulates to nothing but
                     # stops idle proxies from dropping the connection.
@@ -654,6 +659,8 @@ class CoordinatorServer:
                 out.setdefault('response', '')
                 out.setdefault('model', model_name)
                 out.setdefault('created_at', datetime.now().isoformat())
+                # Real Ollama marks why it stopped on the final chunk.
+                out.setdefault('done_reason', 'stop')
                 # Send only the tail we haven't streamed, so a client that
                 # accumulates chunks ends up with the answer exactly once. If
                 # the streamed text isn't a prefix of the final answer (a
